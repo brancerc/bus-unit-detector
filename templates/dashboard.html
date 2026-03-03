@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CISA · Monitor Metrobús</title>
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;700;900&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <style>
+    :root{--verde:#00ff88;--amarillo:#ffe600;--rojo:#ff3b3b;--fondo:#090c10;--panel:#0d1117;--borde:#1c2330;--texto:#cdd9e5;}
+    *{margin:0;padding:0;box-sizing:border-box;}
+    body{background:var(--fondo);color:var(--texto);font-family:'Barlow Condensed',sans-serif;
+         min-height:100vh;display:grid;grid-template-rows:auto auto 1fr auto;overflow-x:hidden;}
+    header{display:flex;align-items:center;justify-content:space-between;
+           padding:14px 28px;border-bottom:1px solid var(--borde);background:var(--panel);}
+    .brand{display:flex;align-items:center;gap:14px;}
+    .brand-dot{width:10px;height:10px;border-radius:50%;background:var(--verde);
+               box-shadow:0 0 10px var(--verde);animation:pulse 1.8s ease-in-out infinite;}
+    @keyframes pulse{0%,100%{opacity:1;transform:scale(1);}50%{opacity:.4;transform:scale(1.3);}}
+    .brand-name{font-size:22px;font-weight:900;letter-spacing:4px;text-transform:uppercase;color:#fff;}
+    .brand-sub{font-size:11px;font-weight:300;letter-spacing:3px;color:#556;text-transform:uppercase;}
+    .header-right{display:flex;align-items:center;gap:24px;}
+    .pill{font-family:'Share Tech Mono',monospace;font-size:12px;padding:4px 12px;
+          border-radius:20px;border:1px solid var(--borde);background:#111820;color:#556;}
+    .pill.live{border-color:var(--verde);color:var(--verde);}
+    .pill.pg-ok{border-color:var(--verde);color:var(--verde);}
+    .pill.pg-err{border-color:var(--rojo);color:var(--rojo);animation:pulse 1s infinite;}
+    .back-link{font-family:'Share Tech Mono',monospace;font-size:11px;letter-spacing:2px;
+               text-decoration:none;color:#445;border:1px solid #1c2330;padding:5px 12px;
+               border-radius:20px;transition:all .2s;}
+    .back-link:hover{color:var(--verde);border-color:var(--verde);}
+    #clock{font-family:'Share Tech Mono',monospace;font-size:14px;color:#445;}
+    .tabs{display:flex;background:var(--panel);border-bottom:1px solid var(--borde);}
+    .tab{padding:10px 28px;font-size:11px;font-weight:700;letter-spacing:3px;
+         text-transform:uppercase;cursor:pointer;border-bottom:2px solid transparent;color:#445;transition:all .2s;}
+    .tab:hover{color:var(--texto);}
+    .tab.active{color:var(--verde);border-bottom-color:var(--verde);}
+    .page{display:none;}
+    .page.active{display:grid;}
+    #page-live{grid-template-columns:1fr 340px;height:calc(100vh - 125px);}
+    .video-panel{position:relative;background:#000;display:flex;
+                 align-items:center;justify-content:center;border-right:1px solid var(--borde);}
+    video{width:100%;height:100%;object-fit:contain;display:block;}
+    .video-overlay{position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;}
+    .corner{position:absolute;width:20px;height:20px;border-color:var(--verde);border-style:solid;opacity:.6;}
+    .corner.tl{top:12px;left:12px;border-width:2px 0 0 2px;}
+    .corner.tr{top:12px;right:12px;border-width:2px 2px 0 0;}
+    .corner.bl{bottom:12px;left:12px;border-width:0 0 2px 2px;}
+    .corner.br{bottom:12px;right:12px;border-width:0 2px 2px 0;}
+    .scanline{position:absolute;top:0;left:0;right:0;height:2px;
+              background:linear-gradient(90deg,transparent,var(--verde),transparent);
+              opacity:.15;animation:scan 4s linear infinite;}
+    @keyframes scan{0%{top:0}100%{top:100%}}
+    .side{display:flex;flex-direction:column;overflow-y:auto;background:var(--panel);}
+    .section{padding:20px 24px;border-bottom:1px solid var(--borde);}
+    .section-label{font-size:10px;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:#445;margin-bottom:14px;}
+    .numero-display{font-family:'Share Tech Mono',monospace;font-size:64px;font-weight:400;
+                    line-height:1;color:var(--verde);text-shadow:0 0 40px rgba(0,255,136,.25);
+                    letter-spacing:4px;transition:all .3s ease;min-height:70px;
+                    display:flex;align-items:center;overflow:hidden;word-break:break-all;}
+    .numero-display.nueva{animation:flash .4s ease;}
+    @keyframes flash{0%{color:#fff;text-shadow:0 0 60px #fff;}100%{color:var(--verde);text-shadow:0 0 40px rgba(0,255,136,.25);}}
+    .numero-vacio{color:#223;font-size:48px;}
+    .conf-bar-wrap{margin-top:12px;}
+    .conf-label{font-size:11px;font-weight:300;letter-spacing:2px;color:#445;margin-bottom:6px;display:flex;justify-content:space-between;}
+    .conf-bar-bg{height:4px;background:var(--borde);border-radius:2px;overflow:hidden;}
+    .conf-bar-fill{height:100%;background:linear-gradient(90deg,var(--verde),var(--amarillo));border-radius:2px;transition:width .5s ease;width:0%;}
+    .ts-text{font-family:'Share Tech Mono',monospace;font-size:13px;color:#334;margin-top:10px;letter-spacing:1px;}
+    .metrics-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+    .metric-card{background:#0a0f16;border:1px solid var(--borde);border-radius:6px;padding:12px 14px;}
+    .metric-val{font-family:'Share Tech Mono',monospace;font-size:26px;color:var(--amarillo);line-height:1;}
+    .metric-lbl{font-size:10px;letter-spacing:2px;color:#334;margin-top:4px;text-transform:uppercase;}
+    .metric-val.rojo{color:var(--rojo);}
+    .status-row{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #111820;font-size:12px;letter-spacing:1px;}
+    .status-row:last-child{border-bottom:none;}
+    .status-key{color:#334;}
+    .status-val{font-family:'Share Tech Mono',monospace;color:#556;}
+    .status-val.ok{color:var(--verde);}
+    .status-val.err{color:var(--rojo);}
+    #page-historial{height:calc(100vh - 125px);overflow-y:auto;}
+    #page-historial.active{display:flex;flex-direction:column;gap:20px;padding:28px;}
+    .hist-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;}
+    .stat-card{background:var(--panel);border:1px solid var(--borde);border-radius:8px;padding:16px 20px;}
+    .stat-val{font-family:'Share Tech Mono',monospace;font-size:32px;color:var(--amarillo);}
+    .stat-lbl{font-size:11px;letter-spacing:2px;color:#445;margin-top:4px;text-transform:uppercase;}
+    .hist-toolbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
+    .hist-toolbar input[type=date]{background:var(--panel);border:1px solid var(--borde);
+      color:var(--texto);padding:8px 14px;border-radius:6px;font-family:'Share Tech Mono',monospace;font-size:13px;}
+    .btn{padding:8px 18px;border-radius:6px;border:1px solid var(--verde);background:transparent;
+         color:var(--verde);font-family:'Barlow Condensed',sans-serif;font-size:13px;
+         font-weight:700;letter-spacing:2px;cursor:pointer;transition:all .2s;}
+    .btn:hover{background:var(--verde);color:#000;}
+    .btn.danger{border-color:var(--rojo);color:var(--rojo);}
+    .btn.danger:hover{background:var(--rojo);color:#fff;}
+    .hist-table-wrap{overflow-x:auto;}
+    table{width:100%;border-collapse:collapse;font-size:13px;}
+    th{text-align:left;padding:10px 14px;font-size:10px;letter-spacing:3px;text-transform:uppercase;color:#445;border-bottom:1px solid var(--borde);}
+    td{padding:10px 14px;border-bottom:1px solid #0d1117;}
+    tr:hover td{background:#0d1117;}
+    .badge-num{font-family:'Share Tech Mono',monospace;color:var(--verde);font-size:16px;letter-spacing:2px;}
+    .badge-conf{font-family:'Share Tech Mono',monospace;font-size:12px;padding:2px 8px;border-radius:4px;background:#0a1a10;color:var(--verde);}
+    .thumb{width:60px;height:40px;object-fit:cover;border-radius:3px;cursor:pointer;border:1px solid var(--borde);}
+    .thumb:hover{border-color:var(--verde);}
+    .empty-state{text-align:center;padding:60px;color:#334;font-size:14px;letter-spacing:2px;}
+    footer{padding:8px 28px;border-top:1px solid var(--borde);background:var(--panel);
+           display:flex;justify-content:space-between;align-items:center;font-size:11px;color:#334;letter-spacing:2px;}
+    footer a{color:#445;text-decoration:none;}
+    footer a:hover{color:var(--verde);}
+    @media(max-width:900px){
+      #page-live{grid-template-columns:1fr;grid-template-rows:auto 1fr;}
+      .video-panel{min-height:240px;border-right:none;border-bottom:1px solid var(--borde);}
+      .numero-display{font-size:48px;}
+      .hist-stats{grid-template-columns:1fr 1fr;}
+    }
+  </style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="brand-dot"></div>
+    <div>
+      <div class="brand-name">CISA</div>
+      <div class="brand-sub">Monitor Metrobús · Jetson Orin Nano</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <span class="pill live">● EN VIVO</span>
+    <span class="pill" id="hls-pill">HLS · iniciando...</span>
+    <span class="pill" id="pg-pill">PG · ...</span>
+    <a class="back-link" href="/">← número</a>
+    <span id="clock">--:--:--</span>
+  </div>
+</header>
+
+<div class="tabs">
+  <div class="tab active" onclick="showTab('live')">▶ EN VIVO</div>
+  <div class="tab"        onclick="showTab('historial')">☰ HISTORIAL</div>
+</div>
+
+<div id="page-live" class="page active">
+  <div class="video-panel">
+    <video id="video" autoplay muted playsinline></video>
+    <div class="video-overlay">
+      <div class="corner tl"></div><div class="corner tr"></div>
+      <div class="corner bl"></div><div class="corner br"></div>
+      <div class="scanline"></div>
+    </div>
+  </div>
+  <div class="side">
+    <div class="section">
+      <div class="section-label">Número económico</div>
+      <div class="numero-display numero-vacio" id="numero">_ _ _ _</div>
+      <div class="conf-bar-wrap">
+        <div class="conf-label"><span>CONFIANZA YOLO</span><span id="conf-pct">—</span></div>
+        <div class="conf-bar-bg"><div class="conf-bar-fill" id="conf-bar"></div></div>
+      </div>
+      <div class="ts-text" id="ts">Esperando detección...</div>
+    </div>
+    <div class="section">
+      <div class="section-label">Rendimiento</div>
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-val" id="fps-val">--</div>
+          <div class="metric-lbl">FPS · GPU</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-val" id="total-val">0</div>
+          <div class="metric-lbl">Aceptadas ✓</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-val" id="pg-count">--</div>
+          <div class="metric-lbl">Unidades PG</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-val rojo" id="desc-val">0</div>
+          <div class="metric-lbl">Descartadas ✗</div>
+        </div>
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-label">Sistema</div>
+      <div class="status-row">
+        <span class="status-key">Pipeline</span>
+        <span class="status-val" id="s-pipeline">--</span>
+      </div>
+      <div class="status-row">
+        <span class="status-key">Modelo</span>
+        <span class="status-val ok">best.engine</span>
+      </div>
+      <div class="status-row">
+        <span class="status-key">OCR</span>
+        <span class="status-val ok">Tesseract · CPU</span>
+      </div>
+      <div class="status-row">
+        <span class="status-key">PostgreSQL</span>
+        <span class="status-val" id="s-pg">verificando...</span>
+      </div>
+      <div class="status-row">
+        <span class="status-key">Validación</span>
+        <span class="status-val ok">ESTRICTA · solo BD</span>
+      </div>
+      <div class="status-row">
+        <span class="status-key">HLS</span>
+        <span class="status-val ok" id="s-hls">bajo demanda</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="page-historial" class="page">
+  <div class="hist-stats">
+    <div class="stat-card"><div class="stat-val" id="stat-total">--</div><div class="stat-lbl">Total registros</div></div>
+    <div class="stat-card"><div class="stat-val" id="stat-hoy">--</div><div class="stat-lbl">Hoy</div></div>
+    <div class="stat-card"><div class="stat-val" id="stat-ultima">--</div><div class="stat-lbl">Última detección</div></div>
+  </div>
+  <div class="hist-toolbar">
+    <input type="date" id="filtro-fecha">
+    <button class="btn" onclick="cargarHistorial()">BUSCAR</button>
+    <button class="btn" onclick="cargarHistorial(null,200)">ÚLTIMAS 200</button>
+    <button class="btn danger" onclick="exportarCSV()">↓ EXPORTAR CSV</button>
+  </div>
+  <div class="hist-table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Número económico</th><th>Estado</th><th>Confianza</th><th>Fecha</th><th>Hora</th><th>Frame</th></tr></thead>
+      <tbody id="tabla-body"><tr><td colspan="7" class="empty-state">Cargando...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<footer>
+  <span>CISA · Validación ESTRICTA contra PostgreSQL</span>
+  <span><a href="/api/estado">API Estado</a> · <a href="/api/detecciones">API Detecciones</a> · <a href="/api/unidades">API Unidades</a></span>
+</footer>
+
+<script>
+function tick(){document.getElementById('clock').textContent=new Date().toTimeString().slice(0,8);}
+tick();setInterval(tick,1000);
+
+function showTab(name){
+  document.querySelectorAll('.tab').forEach((t,i)=>{t.classList.toggle('active',['live','historial'][i]===name);});
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.getElementById('page-'+name).classList.add('active');
+  if(name==='historial'){cargarStats();cargarHistorial();}
+}
+
+const video=document.getElementById('video');
+let hlsObj=null;
+let lastTime=0, stallCount=0;
+
+function initHLS(){
+  if(hlsObj){ hlsObj.destroy(); hlsObj=null; }
+  if(Hls.isSupported()){
+    hlsObj=new Hls({
+      liveSyncDurationCount:2,
+      liveMaxLatencyDurationCount:4,
+      maxLiveSyncPlaybackRate:1.5,
+      lowLatencyMode:false,
+      manifestLoadingMaxRetry:999,
+      levelLoadingMaxRetry:999,
+      fragLoadingMaxRetry:999,
+      manifestLoadingRetryDelay:1000,
+      fragLoadingRetryDelay:1000,
+    });
+    hlsObj.loadSource('/hls/stream.m3u8');
+    hlsObj.attachMedia(video);
+    hlsObj.on(Hls.Events.MANIFEST_PARSED,()=>{ video.play(); stallCount=0; });
+    hlsObj.on(Hls.Events.ERROR,(e,d)=>{ if(d.fatal) setTimeout(initHLS, 3000); });
+    document.getElementById('hls-pill').textContent='HLS · activo';
+  } else if(video.canPlayType('application/vnd.apple.mpegurl')){
+    video.src='/hls/stream.m3u8'; video.play();
+  }
+}
+
+setInterval(()=>{
+  if(!video.paused && video.readyState >= 2){
+    if(video.currentTime === lastTime){ stallCount++; if(stallCount >= 2){ stallCount=0; initHLS(); } }
+    else { stallCount=0; lastTime=video.currentTime; }
+  }
+}, 4000);
+
+async function pingHLS(){ try{ await fetch('/api/hls-ping'); }catch(e){} }
+fetch('/api/hls-start').then(()=>{ setTimeout(initHLS, 3000); });
+setInterval(pingHLS, 5000);
+
+let prevNumero=null;
+async function poll(){
+  try{
+    const d=await fetch('/api/estado').then(r=>r.json());
+    document.getElementById('fps-val').textContent=d.fps||'--';
+    document.getElementById('total-val').textContent=d.total_detecciones||0;
+    document.getElementById('desc-val').textContent=d.descartadas||0;
+    document.getElementById('pg-count').textContent=d.unidades_registradas||'--';
+
+    const pgPill=document.getElementById('pg-pill');
+    const sPg=document.getElementById('s-pg');
+    if(d.pg_conectada){
+      pgPill.textContent='PG ✓ '+d.unidades_registradas+' uds';
+      pgPill.className='pill pg-ok';
+      sPg.textContent='postgres · '+d.unidades_registradas+' uds';
+      sPg.className='status-val ok';
+    }else{
+      pgPill.textContent='PG ✗ DESCONECTADA';
+      pgPill.className='pill pg-err';
+      sPg.textContent='ERROR · sin conexión';
+      sPg.className='status-val err';
+    }
+
+    const sp=document.getElementById('s-pipeline');
+    sp.textContent=d.pipeline?'ACTIVO':'ERROR';sp.className='status-val '+(d.pipeline?'ok':'err');
+    const numEl=document.getElementById('numero');
+    if(d.numero){
+      if(d.numero!==prevNumero){numEl.classList.remove('nueva');void numEl.offsetWidth;numEl.classList.add('nueva');prevNumero=d.numero;}
+      numEl.textContent=d.numero;numEl.classList.remove('numero-vacio');
+      const pct=Math.round((d.conf||0)*100);
+      document.getElementById('conf-pct').textContent=pct+'%';
+      document.getElementById('conf-bar').style.width=pct+'%';
+      document.getElementById('ts').textContent=d.ts||'';
+    }
+  }catch(e){}
+}
+poll();setInterval(poll,2000);
+
+async function cargarStats(){
+  try{
+    const d=await fetch('/api/stats').then(r=>r.json());
+    document.getElementById('stat-total').textContent=d.total;
+    document.getElementById('stat-hoy').textContent=d.hoy;
+    document.getElementById('stat-ultima').textContent=d.ultima?d.ultima.numero:'--';
+  }catch(e){}
+}
+
+async function cargarHistorial(fecha=null,limit=50){
+  const f=fecha||document.getElementById('filtro-fecha').value||null;
+  let url='/api/detecciones?limit='+limit;if(f)url+='&fecha='+f;
+  try{
+    const rows=await fetch(url).then(r=>r.json());
+    const tbody=document.getElementById('tabla-body');
+    if(!rows.length){tbody.innerHTML='<tr><td colspan="7" class="empty-state">Sin detecciones</td></tr>';return;}
+    tbody.innerHTML=rows.map(r=>{
+      const estadoColor = r.estado==='VERIFICADO'?'#00ff88': r.estado==='CORREGIDO'?'#ffe600':'#ff3b3b';
+      const estadoIcon  = r.estado==='VERIFICADO'?'✓': r.estado==='CORREGIDO'?'~':'⚠';
+      return `<tr>
+        <td style="color:#334;font-family:'Share Tech Mono',monospace">${r.id}</td>
+        <td><span class="badge-num">${r.numero}</span></td>
+        <td><span style="font-family:'Share Tech Mono',monospace;font-size:11px;color:${estadoColor}">${estadoIcon} ${r.estado||'—'}</span></td>
+        <td><span class="badge-conf">${Math.round(r.confianza*100)}%</span></td>
+        <td style="color:#556;font-family:'Share Tech Mono',monospace">${r.fecha}</td>
+        <td style="color:#556;font-family:'Share Tech Mono',monospace">${r.hora}</td>
+        <td>${r.frame?`<img class="thumb" src="/frames/${r.frame}" onclick="window.open('/frames/${r.frame}')" title="${r.frame}">`:'—'}</td>
+      </tr>`;
+    }).join('');
+  }catch(e){}
+}
+
+async function exportarCSV(){
+  const f=document.getElementById('filtro-fecha').value||null;
+  let url='/api/detecciones?limit=9999';if(f)url+='&fecha='+f;
+  const rows=await fetch(url).then(r=>r.json());
+  if(!rows.length){alert('Sin datos');return;}
+  const csv=['id,numero,estado,confianza,fecha,hora,frame',...rows.map(r=>`${r.id},${r.numero},${r.estado||''},${r.confianza},${r.fecha},${r.hora},${r.frame||''}`)].join('\n');
+  const a=document.createElement('a');
+  a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);
+  a.download='cisa_'+(f||'todas')+'.csv';a.click();
+}
+
+document.getElementById('filtro-fecha').value=new Date().toISOString().slice(0,10);
+</script>
+</body>
+</html>
