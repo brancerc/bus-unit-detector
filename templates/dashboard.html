@@ -221,8 +221,8 @@
   </div>
   <div class="hist-table-wrap">
     <table>
-      <thead><tr><th>#</th><th>Número económico</th><th>Estado</th><th>Confianza</th><th>Fecha</th><th>Hora</th><th>Frame</th></tr></thead>
-      <tbody id="tabla-body"><tr><td colspan="7" class="empty-state">Cargando...</td></tr></tbody>
+      <thead><tr><th>#</th><th>Nº Económico</th><th>OCR leyó</th><th>Estado</th><th>Confianza</th><th>Hora paso</th><th>Duración</th><th>Frame</th></tr></thead>
+      <tbody id="tabla-body"><tr><td colspan="8" class="empty-state">Cargando...</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -325,7 +325,7 @@ async function cargarStats(){
     const d=await fetch('/api/stats').then(r=>r.json());
     document.getElementById('stat-total').textContent=d.total;
     document.getElementById('stat-hoy').textContent=d.hoy;
-    document.getElementById('stat-ultima').textContent=d.ultima?d.ultima.numero:'--';
+    document.getElementById('stat-ultima').textContent=d.ultima?d.ultima.no_economico||d.ultima.no_detectado:'--';
   }catch(e){}
 }
 
@@ -335,18 +335,19 @@ async function cargarHistorial(fecha=null,limit=50){
   try{
     const rows=await fetch(url).then(r=>r.json());
     const tbody=document.getElementById('tabla-body');
-    if(!rows.length){tbody.innerHTML='<tr><td colspan="7" class="empty-state">Sin detecciones</td></tr>';return;}
+    if(!rows.length){tbody.innerHTML='<tr><td colspan="8" class="empty-state">Sin detecciones</td></tr>';return;}
     tbody.innerHTML=rows.map(r=>{
       const estadoColor = r.estado==='VERIFICADO'?'#00ff88': r.estado==='CORREGIDO'?'#ffe600':'#ff3b3b';
       const estadoIcon  = r.estado==='VERIFICADO'?'✓': r.estado==='CORREGIDO'?'~':'⚠';
       return `<tr>
-        <td style="color:#334;font-family:'Share Tech Mono',monospace">${r.id}</td>
-        <td><span class="badge-num">${r.numero}</span></td>
+        <td style="color:#334;font-family:'Share Tech Mono',monospace">${r.id_evento}</td>
+        <td><span class="badge-num">${r.no_economico||'—'}</span></td>
+        <td style="color:#778;font-family:'Share Tech Mono',monospace;font-size:11px">${r.no_detectado||'—'}</td>
         <td><span style="font-family:'Share Tech Mono',monospace;font-size:11px;color:${estadoColor}">${estadoIcon} ${r.estado||'—'}</span></td>
         <td><span class="badge-conf">${Math.round(r.confianza*100)}%</span></td>
-        <td style="color:#556;font-family:'Share Tech Mono',monospace">${r.fecha}</td>
-        <td style="color:#556;font-family:'Share Tech Mono',monospace">${r.hora}</td>
-        <td>${r.frame?`<img class="thumb" src="/frames/${r.frame}" onclick="window.open('/frames/${r.frame}')" title="${r.frame}">`:'—'}</td>
+        <td style="color:#556;font-family:'Share Tech Mono',monospace">${r.hora_paso||''}</td>
+        <td style="color:#556;font-family:'Share Tech Mono',monospace">${r.duracion_camara?r.duracion_camara.toFixed(1)+'s':'—'}</td>
+        <td>${r.captura_url?`<img class="thumb" src="/frames/${r.captura_url}" onclick="window.open('/frames/${r.captura_url}')" title="${r.captura_url}">`:'—'}</td>
       </tr>`;
     }).join('');
   }catch(e){}
@@ -357,7 +358,7 @@ async function exportarCSV(){
   let url='/api/detecciones?limit=9999';if(f)url+='&fecha='+f;
   const rows=await fetch(url).then(r=>r.json());
   if(!rows.length){alert('Sin datos');return;}
-  const csv=['id,numero,estado,confianza,fecha,hora,frame',...rows.map(r=>`${r.id},${r.numero},${r.estado||''},${r.confianza},${r.fecha},${r.hora},${r.frame||''}`)].join('\n');
+  const csv=['id_evento,no_economico,no_detectado,estado,confianza,hora_paso,duracion_camara,captura_url',...rows.map(r=>`${r.id_evento},${r.no_economico||''},${r.no_detectado||''},${r.estado||''},${r.confianza},${r.hora_paso||''},${r.duracion_camara||0},${r.captura_url||''}`)].join('\n');
   const a=document.createElement('a');
   a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);
   a.download='cisa_'+(f||'todas')+'.csv';a.click();
