@@ -15,7 +15,7 @@ TG_CHAT_ID = "-5249532175"
 # ==============================================================================
 # CAMARA / RTSP
 # ==============================================================================
-RTSP_URL  = "rtsp://admin:PatioCCA_@192.168.10.2:554/cam/realmonitor?channel=1&subtype=0"
+RTSP_URL  = "rtsp://admin:PatioCCA_@192.168.10.2:554/cam/realmonitor?channel=1&subtype=1"
 PIPELINE  = (
     f"rtspsrc location={RTSP_URL} "
     "protocols=tcp latency=200 ! "
