@@ -19,10 +19,11 @@ from ultralytics import YOLO
 from flask import Flask, send_file, jsonify, request, make_response
 
 from config import (
-    PIPELINE, HLS_DIR, FRAMES_DIR, DESCONOCIDAS_DIR, CROPS_DIR, CLEAN_DIR, DB_PATH,
+    PIPELINE, HLS_DIR, FRAMES_DIR, DESCONOCIDAS_DIR, CROPS_DIR, CLEAN_DIR,
+    CLEAN_LATERAL_DIR, CLEAN_TRASERO_DIR, DB_PATH,
     PG_CONFIG, MODEL_PATH, MODEL_CONF, COOLDOWN_SEG, N_VOTOS, VOTO_WINDOW,
     OCR_TARGET_H, OCR_MIN_SIZE, OCR_MAX_DIGITS, OCR_MIN_DIGITS,
-    LEVENSHTEIN_MAX, HLS_TIMEOUT, HLS_RESOLUTION, HLS_FPS,
+    LEVENSHTEIN_MAX, ID_PUERTA, HLS_TIMEOUT, HLS_RESOLUTION, HLS_FPS,
     FLASK_HOST, FLASK_PORT, PG_REFRESH_INTERVAL
 )
 from alertas import (
@@ -180,49 +181,77 @@ threading.Thread(target=_refresh_unidades_loop, daemon=True).start()
 # ==============================================================================
 
 def init_db():
+    """
+    Esquema SQLite espejo de eventoPaso (PostgreSQL).
+    Misma estructura para facilitar migracion de datos confirmados.
+    Campos extra (estado, confianza) se ignoran al migrar.
+    """
     con = sqlite3.connect(DB_PATH)
     con.execute("""
-        CREATE TABLE IF NOT EXISTS detecciones (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            numero    TEXT    NOT NULL,
-            confianza REAL    NOT NULL,
-            fecha     TEXT    NOT NULL,
-            hora      TEXT    NOT NULL,
-            ts        TEXT    NOT NULL,
-            frame     TEXT,
-            estado    TEXT    DEFAULT 'VERIFICADO',
-            duracion  REAL   DEFAULT 0
+        CREATE TABLE IF NOT EXISTS evento_paso (
+            id_evento       INTEGER PRIMARY KEY AUTOINCREMENT,
+            no_detectado    TEXT    NOT NULL,
+            no_economico    TEXT,
+            direccion       TEXT    DEFAULT 'entrada',
+            hora_paso       TEXT    NOT NULL,
+            id_puerta       INTEGER DEFAULT 1,
+            hora_registro   TEXT    NOT NULL,
+            captura_url     TEXT,
+            estado          TEXT    DEFAULT 'VERIFICADO',
+            confianza       REAL    DEFAULT 0,
+            duracion_camara REAL    DEFAULT 0
         )
     """)
+    # Migrar tabla vieja si existe
     try:
-        con.execute("ALTER TABLE detecciones ADD COLUMN duracion REAL DEFAULT 0")
-        print("[DB] Columna 'duracion' agregada a tabla existente.")
+        cur = con.execute("SELECT COUNT(*) FROM detecciones")
+        old_count = cur.fetchone()[0]
+        if old_count > 0:
+            con.execute("""
+                INSERT OR IGNORE INTO evento_paso
+                    (no_detectado, no_economico, hora_paso, hora_registro, captura_url, estado, confianza)
+                SELECT numero, numero, ts, ts, frame, estado, confianza
+                FROM detecciones
+            """)
+            con.commit()
+            print(f"[DB] Migrados {old_count} registros de 'detecciones' a 'evento_paso'.")
     except sqlite3.OperationalError:
-        pass
+        pass  # tabla detecciones no existe, todo bien
     con.commit(); con.close()
-    print("[DB] SQLite lista.")
+    print("[DB] SQLite lista (esquema evento_paso).")
 
 
-def db_insert(numero, confianza, frame_path=None, estado="VERIFICADO", duracion=0):
+def db_insert(no_detectado, no_economico, confianza, captura_url=None,
+              estado="VERIFICADO", duracion=0):
+    """
+    Inserta un evento en evento_paso (espejo de PostgreSQL).
+    no_detectado: lo que OCR leyo (crudo)
+    no_economico: numero validado/corregido contra PG (None si desconocida)
+    """
     now = datetime.now()
     try:
         con = sqlite3.connect(DB_PATH)
         con.execute(
-            "INSERT INTO detecciones (numero,confianza,fecha,hora,ts,frame,estado,duracion) VALUES (?,?,?,?,?,?,?,?)",
-            (numero, round(confianza, 3),
-             now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"),
-             now.strftime("%Y-%m-%d %H:%M:%S"), frame_path, estado, round(duracion, 1)))
+            """INSERT INTO evento_paso
+               (no_detectado, no_economico, direccion, hora_paso, id_puerta,
+                hora_registro, captura_url, estado, confianza, duracion_camara)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (no_detectado, no_economico, "entrada",
+             now.strftime("%Y-%m-%d %H:%M:%S"), ID_PUERTA,
+             now.strftime("%Y-%m-%d %H:%M:%S"), captura_url,
+             estado, round(confianza, 3), round(duracion, 1)))
         con.commit(); con.close()
     except Exception as e:
         print(f"[DB ERROR] {e}")
 
 
-def db_update_duracion(numero, ts, duracion):
+def db_update_duracion(no_economico, hora_paso, duracion):
+    """Actualiza duracion_camara del ultimo evento de este numero."""
     try:
         con = sqlite3.connect(DB_PATH)
         con.execute(
-            "UPDATE detecciones SET duracion=? WHERE numero=? AND ts=?",
-            (round(duracion, 1), numero, ts))
+            "UPDATE evento_paso SET duracion_camara=? WHERE no_economico=? AND hora_paso=?",
+            (round(duracion, 1), no_economico, hora_paso))
         con.commit(); con.close()
     except Exception as e:
         print(f"[DB ERROR] update duracion: {e}")
@@ -234,11 +263,11 @@ def db_query(fecha=None, limit=50):
         con.row_factory = sqlite3.Row
         if fecha:
             rows = con.execute(
-                "SELECT * FROM detecciones WHERE fecha=? ORDER BY id DESC LIMIT ?",
+                "SELECT * FROM evento_paso WHERE date(hora_paso)=? ORDER BY id_evento DESC LIMIT ?",
                 (fecha, limit)).fetchall()
         else:
             rows = con.execute(
-                "SELECT * FROM detecciones ORDER BY id DESC LIMIT ?",
+                "SELECT * FROM evento_paso ORDER BY id_evento DESC LIMIT ?",
                 (limit,)).fetchall()
         con.close()
         return [dict(r) for r in rows]
@@ -249,10 +278,11 @@ def db_query(fecha=None, limit=50):
 def db_stats():
     try:
         con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
         hoy   = datetime.now().strftime("%Y-%m-%d")
-        total = con.execute("SELECT COUNT(*) FROM detecciones").fetchone()[0]
-        hoy_c = con.execute("SELECT COUNT(*) FROM detecciones WHERE fecha=?", (hoy,)).fetchone()[0]
-        ult   = con.execute("SELECT * FROM detecciones ORDER BY id DESC LIMIT 1").fetchone()
+        total = con.execute("SELECT COUNT(*) FROM evento_paso").fetchone()[0]
+        hoy_c = con.execute("SELECT COUNT(*) FROM evento_paso WHERE date(hora_paso)=?", (hoy,)).fetchone()[0]
+        ult   = con.execute("SELECT * FROM evento_paso ORDER BY id_evento DESC LIMIT 1").fetchone()
         con.close()
         return {"total": total, "hoy": hoy_c, "ultima": dict(ult) if ult else None}
     except Exception as e:
@@ -307,6 +337,67 @@ def validar_numero(leido):
     return None, None
 
 
+
+
+def recuperar_ocr(leido):
+    """
+    Intenta recuperar lecturas OCR erroneas usando patrones conocidos:
+    1. Si lee 3 digitos, antepone '5' y valida (el 5 inicial se pierde frecuentemente)
+    2. Si lee 4 digitos con primer digito != 5, reemplaza por '5' y valida
+       (confusion tipica: 5->4, 5->1, 5->0, 5->2, 5->3)
+    3. Si lee 4 digitos con segundo digito != 0, reemplaza por '0' y valida
+       (confusion tipica: 0->5, 0->6)
+    """
+    leido = leido.strip()
+
+    with _unidades_lock:
+        unidades_snapshot = UNIDADES.copy()
+
+    if not unidades_snapshot:
+        return None, None
+
+    # Estrategia 1: 3 digitos -> anteponer '5'
+    if len(leido) == 3:
+        candidato = '5' + leido
+        if candidato in unidades_snapshot:
+            print(f"[RECUPERADO] OCR '{leido}' -> prefijo '5' -> '{candidato}'")
+            return candidato, "CORREGIDO"
+        # Tambien probar con Levenshtein sobre el candidato
+        for u in unidades_snapshot:
+            if len(u) == 4 and levenshtein(candidato, u) <= LEVENSHTEIN_MAX:
+                print(f"[RECUPERADO] OCR '{leido}' -> '5'+'{leido}' ~ '{u}' (Lev)")
+                return u, "CORREGIDO"
+
+    # Estrategia 2: 4 digitos, primer digito no es '5' -> forzar '5'
+    if len(leido) == 4 and leido[0] != '5':
+        candidato = '5' + leido[1:]
+        if candidato in unidades_snapshot:
+            print(f"[RECUPERADO] OCR '{leido}' -> primer digito '5' -> '{candidato}'")
+            return candidato, "CORREGIDO"
+        for u in unidades_snapshot:
+            if len(u) == 4 and levenshtein(candidato, u) <= LEVENSHTEIN_MAX:
+                print(f"[RECUPERADO] OCR '{leido}' -> '5'+'{leido[1:]}' ~ '{u}' (Lev)")
+                return u, "CORREGIDO"
+
+    # Estrategia 3: 4 digitos, segundo digito no es '0' -> forzar '50'
+    if len(leido) == 4 and leido[0] == '5' and leido[1] != '0':
+        candidato = '50' + leido[2:]
+        if candidato in unidades_snapshot:
+            print(f"[RECUPERADO] OCR '{leido}' -> forzar '50xx' -> '{candidato}'")
+            return candidato, "CORREGIDO"
+
+    return None, None
+
+
+def _clean_dir_for_class(cls_name):
+    """Retorna el directorio de frames limpios segun la clase YOLO."""
+    cls_lower = cls_name.lower()
+    if 'lateral' in cls_lower:
+        return CLEAN_LATERAL_DIR
+    elif 'trasero' in cls_lower or 'trasera' in cls_lower:
+        return CLEAN_TRASERO_DIR
+    return CLEAN_DIR
+
 # ==============================================================================
 # Tesseract OCR
 # ==============================================================================
@@ -323,19 +414,36 @@ def leer_numero(crop):
         crop_up = cv2.resize(crop, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(crop_up, cv2.COLOR_BGR2GRAY)
 
+        # Denoising: eliminar artefactos de compresion H.264
+        gray = cv2.fastNlMeansDenoising(gray, h=12, templateWindowSize=7, searchWindowSize=21)
+
+        # Kernel para operaciones morfologicas
+        kern = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+
         resultados = []
 
+        # Estrategia 1: CLAHE + Otsu + morfologia
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
         g1 = clahe.apply(gray)
         _, g1 = cv2.threshold(g1, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        g1 = cv2.morphologyEx(g1, cv2.MORPH_CLOSE, kern)  # Cerrar trazos rotos
+        g1 = cv2.morphologyEx(g1, cv2.MORPH_OPEN, kern)   # Eliminar ruido puntual
 
+        # Estrategia 2: Adaptivo + morfologia
         g2 = cv2.adaptiveThreshold(gray, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 8)
+        g2 = cv2.morphologyEx(g2, cv2.MORPH_CLOSE, kern)
 
+        # Estrategia 3: Invertida de g1
         g3 = cv2.bitwise_not(g1)
 
+        # Estrategia 4: Bilateral + Otsu (preserva bordes mejor que denoising global)
+        g4_blur = cv2.bilateralFilter(gray, 9, 75, 75)
+        _, g4 = cv2.threshold(g4_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        g4 = cv2.morphologyEx(g4, cv2.MORPH_CLOSE, kern)
+
         config = '--psm 7 -c tessedit_char_whitelist=0123456789'
-        for img_proc in [g1, g2, g3]:
+        for img_proc in [g1, g2, g3, g4]:
             texto = pytesseract.image_to_string(img_proc, config=config).strip()
             limpio = re.sub(r'[^0-9]', '', texto)[:OCR_MAX_DIGITS]
             if len(limpio) >= OCR_MIN_DIGITS:
@@ -343,10 +451,11 @@ def leer_numero(crop):
 
         if not resultados:
             config8 = '--psm 8 -c tessedit_char_whitelist=0123456789'
-            texto = pytesseract.image_to_string(g1, config=config8).strip()
-            limpio = re.sub(r'[^0-9]', '', texto)[:OCR_MAX_DIGITS]
-            if len(limpio) >= OCR_MIN_DIGITS:
-                resultados.append(limpio)
+            for img_proc in [g1, g4]:
+                texto = pytesseract.image_to_string(img_proc, config=config8).strip()
+                limpio = re.sub(r'[^0-9]', '', texto)[:OCR_MAX_DIGITS]
+                if len(limpio) >= OCR_MIN_DIGITS:
+                    resultados.append(limpio)
 
         if not resultados:
             return None
@@ -519,23 +628,21 @@ class InferenceStream:
         self._cnt = 0
         self._t = time.time()
         self._votos = []
-        self._last_ts = 0.0  # Cooldown entre detecciones
-        # TODO: Habilitar tracking cuando el sistema este estable
-        # self.tracker = SimpleTracker()
-        # self._track_ts = None
-        # self._track_frame = None
+        self.tracker = SimpleTracker()
+        self._track_ts = None
+        self._track_frame = None
         self._pending_desc = None
         self._pending_desc_timer = None
 
-    # def _cerrar_track(self, track, duracion):
-    #     if track and self._track_ts:
-    #         db_update_duracion(track['numero'], self._track_ts, duracion)
-    #         print(f"[TRACK FIN] {track['numero']} salio de camara | Duracion: {duracion}s")
-    #         with state_lock:
-    #             STATE["tracking"] = None
-    #             STATE["tracking_duracion"] = 0
-    #         self._track_ts = None
-    #         self._track_frame = None
+    def _cerrar_track(self, track, duracion):
+        if track and self._track_ts:
+            db_update_duracion(track['numero'], self._track_ts, duracion)
+            print(f"[TRACK FIN] {track['numero']} salio de camara | Duracion: {duracion}s")
+            with state_lock:
+                STATE["tracking"] = None
+                STATE["tracking_duracion"] = 0
+            self._track_ts = None
+            self._track_frame = None
 
     def update(self):
         while self.running:
@@ -557,22 +664,31 @@ class InferenceStream:
                         with _unidades_lock:
                             STATE["unidades_registradas"] = len(UNIDADES)
 
-                # TODO: Tracking deshabilitado temporalmente
-                # gone_track, gone_dur = self.tracker.check_gone()
-                # if gone_track:
-                #     self._cerrar_track(gone_track, gone_dur)
-                # if self.tracker.active:
-                #     with state_lock:
-                #         STATE["tracking"] = self.tracker.active['numero']
-                #         STATE["tracking_duracion"] = self.tracker.get_duration()
+                # Verificar si el bus rastreado se fue
+                gone_track, gone_dur = self.tracker.check_gone()
+                if gone_track:
+                    self._cerrar_track(gone_track, gone_dur)
+
+                # Actualizar duracion en STATE
+                if self.tracker.active:
+                    with state_lock:
+                        STATE["tracking"] = self.tracker.active['numero']
+                        STATE["tracking_duracion"] = self.tracker.get_duration()
 
                 for box in results[0].boxes:
                     conf = float(box.conf[0])
-                    now  = time.time()
-                    if (now - self._last_ts) < COOLDOWN_SEG:
-                        continue
-
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    bbox = (x1, y1, x2, y2)
+
+                    # Nombre de clase YOLO (num_delantero, num_trasero, num_lateral)
+                    cls_id = int(box.cls[0])
+                    cls_name = model.names.get(cls_id, "numero")
+
+                    # Filtro de aspecto: rechazar crops demasiado anchos (letreros, anuncios)
+                    box_w, box_h = x2 - x1, y2 - y1
+                    aspect = box_w / max(box_h, 1)
+                    if aspect > 3.0 or aspect < 0.2:
+                        continue
 
                     pad_x, pad_y = 20, 10
                     h_img, w_img = img.shape[:2]
@@ -600,6 +716,10 @@ class InferenceStream:
 
                     numero_valido, estado = validar_numero(numero_leido)
 
+                    # Recuperacion OCR: si fallo, intentar corregir patrones comunes
+                    if numero_valido is None:
+                        numero_valido, estado = recuperar_ocr(numero_leido)
+
                     # -- DESCONOCIDO --
                     if numero_valido is None:
                         ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -614,8 +734,9 @@ class InferenceStream:
                         desc_crop_name = f"{ts_str}_DESCONOCIDA_{numero_leido}_crop.jpg"
                         cv2.imwrite(os.path.join(DESCONOCIDAS_DIR, desc_crop_name), crop)
 
+                        clean_dest = _clean_dir_for_class(cls_name)
                         clean_name = f"{ts_str}_DESCONOCIDA_{numero_leido}_clean.jpg"
-                        cv2.imwrite(os.path.join(CLEAN_DIR, clean_name), img)
+                        cv2.imwrite(os.path.join(clean_dest, clean_name), img)
 
                         with state_lock:
                             STATE["descartadas"] += 1
@@ -643,9 +764,7 @@ class InferenceStream:
                             (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
                         continue
 
-                    # -- NUMERO VALIDO --
-                    self._last_ts = time.time()
-
+                    # -- NUMERO VALIDO -> TRACKER --
                     # Cancelar alerta DESCONOCIDA pendiente
                     if self._pending_desc_timer:
                         self._pending_desc_timer.cancel()
@@ -654,9 +773,18 @@ class InferenceStream:
                             print(f"[DEBOUNCE] Cancelada alerta DESCONOCIDA '{self._pending_desc[1]}' -> lectura correcta: {numero_valido}")
                             self._pending_desc = None
 
+                    track_result = self.tracker.update(bbox, numero_valido, estado, conf)
+
+                    if track_result == 'TRACKING':
+                        # Mismo bus -> solo dibujar, NO guardar, NO alertar
+                        dur = self.tracker.get_duration()
+                        cv2.putText(annotated, f"{numero_valido} [{dur:.0f}s]",
+                            (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                        continue
+
+                    # -- NEW -> Bus nuevo --
                     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-                    # Frame anotado (para Telegram)
                     frame_name = f"{ts_str}_{numero_valido}.jpg"
                     frame_path = os.path.join(FRAMES_DIR, frame_name)
                     frame_save = annotated.copy()
@@ -664,32 +792,36 @@ class InferenceStream:
                         (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
                     cv2.imwrite(frame_path, frame_save)
 
-                    # Crop limpio
                     crop_name = f"{ts_str}_{numero_valido}_crop.jpg"
                     cv2.imwrite(os.path.join(CROPS_DIR, crop_name), crop)
 
-                    # Frame limpio (para reentrenamiento)
+                    clean_dest = _clean_dir_for_class(cls_name)
                     clean_name = f"{ts_str}_{numero_valido}_clean.jpg"
-                    cv2.imwrite(os.path.join(CLEAN_DIR, clean_name), img)
+                    cv2.imwrite(os.path.join(clean_dest, clean_name), img)
+
+                    self._track_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self._track_frame = frame_name
 
                     with state_lock:
                         STATE["numero"] = numero_valido
                         STATE["conf"]   = round(conf, 3)
-                        STATE["ts"]     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        STATE["ts"]     = self._track_ts
                         STATE["total_detecciones"] += 1
+                        STATE["tracking"] = numero_valido
+                        STATE["tracking_duracion"] = 0
 
-                    db_insert(numero_valido, conf, frame_name, estado)
-                    print(f"[{estado}] {numero_valido} | Conf: {conf:.2f} | Frame: {frame_name}")
+                    db_insert(numero_leido, numero_valido, conf, frame_name, estado, duracion=0)
+                    print(f"[NEW {estado}] {numero_valido} | Conf: {conf:.2f} | TRACKING iniciado")
 
-                    ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    ts_now = self._track_ts
                     threading.Thread(
                         target=alerta_unidad_detectada,
                         args=(frame_path, numero_valido, conf, ts_now),
                         daemon=True
                     ).start()
 
-                    cv2.putText(annotated, numero_valido,
-                        (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+                    cv2.putText(annotated, f"{numero_valido} [0s]",
+                        (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
 
                 # -- Overlay --
                 cv2.putText(annotated, f"FPS: {self.fps:.1f}",
@@ -702,12 +834,11 @@ class InferenceStream:
                 cv2.putText(annotated, pg_text,
                     (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, pg_color, 2)
 
-                # TODO: Overlay de tracking deshabilitado
-                # if self.tracker.active:
-                #     dur = self.tracker.get_duration()
-                #     track_text = f"TRACK: {self.tracker.active['numero']} | {dur:.0f}s en camara"
-                #     cv2.putText(annotated, track_text,
-                #         (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                if self.tracker.active:
+                    dur = self.tracker.get_duration()
+                    track_text = f"TRACK: {self.tracker.active['numero']} | {dur:.0f}s en camara"
+                    cv2.putText(annotated, track_text,
+                        (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
                 with self.lock: self.result = annotated
                 with hls_lock: hls_push_frame(annotated)
