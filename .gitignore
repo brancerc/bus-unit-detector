@@ -1,10 +1,16 @@
-*.engine
+# Modelos (excepto engine)
 *.onnx
 *.pt
+
+# Instaladores
 *.whl
 *.deb
+
+# Entorno
 venv/
 __pycache__/
+
+# Datos y pruebas
 runs/
 videos_procesados/
 imgs/
@@ -14,3 +20,20 @@ logs/
 *.jpg
 *.csv
 detecciones.db
+
+# Archivos swap de nano/vim
+*.swn
+*.swo
+*.swp
+.*.swn
+.*.swo
+.*.swp
+
+# Scripts de prueba
+check_gpu.py
+check_tailscale.py
+detect.py
+pruebaAres.py
+configurar_site.sh
+constraints.txt
+requirements_backup.txt
