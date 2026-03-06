@@ -694,6 +694,10 @@ class InferenceStream:
                     if aspect > 3.0 or aspect < 0.2:
                         continue
 
+                    # Filtro de tamaño: esperar a que el bus este cerca para leer
+                    if box_h < 40 or box_w < 40:
+                        continue
+
                     pad_x, pad_y = 20, 10
                     h_img, w_img = img.shape[:2]
                     crop = img[max(0, y1-pad_y):min(h_img, y2+pad_y),
