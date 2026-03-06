@@ -417,6 +417,10 @@ def leer_numero(crop):
         # Denoising: eliminar artefactos de compresion H.264
         gray = cv2.fastNlMeansDenoising(gray, h=12, templateWindowSize=7, searchWindowSize=21)
 
+        # Sharpening: restaurar bordes despues del denoising
+        blur = cv2.GaussianBlur(gray, (0, 0), 2.0)
+        gray = cv2.addWeighted(gray, 1.8, blur, -0.8, 0)
+
         # Kernel para operaciones morfologicas
         kern = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
 
