@@ -6,6 +6,7 @@ Pipeline: RTSP → GStreamer → YOLO → OCR → Validación PG → Tracking �
 import cv2
 import glob
 import threading
+import queue
 import time
 import subprocess
 import os
@@ -62,7 +63,7 @@ class SimpleTracker:
     """
 
     IOU_THRESHOLD = 0.20
-    GONE_TIMEOUT  = 3.0
+    GONE_TIMEOUT  = 30.0   # Esperar hasta que realmente salga de camara
 
     def __init__(self):
         self.active = None
@@ -623,6 +624,12 @@ class VideoStream:
 # ==============================================================================
 
 class InferenceStream:
+    """
+    Arquitectura desacoplada:
+    - Hilo principal: YOLO → plot() con cajas → overlay ligero → HLS (siempre fluido)
+    - Hilo OCR: cola de crops → denoising + OCR pesado → validacion → tracker → alertas
+    El video NUNCA se congela por culpa del OCR.
+    """
     def __init__(self, vs):
         self.lock = threading.Lock()
         self.result = None
@@ -631,24 +638,187 @@ class InferenceStream:
         self.fps = 0.0
         self._cnt = 0
         self._t = time.time()
+        # OCR en hilo separado
+        self._ocr_queue = queue.Queue(maxsize=5)
         self._votos = []
         self.tracker = SimpleTracker()
+        self._tracker_lock = threading.Lock()
         self._track_ts = None
         self._track_frame = None
         self._pending_desc = None
         self._pending_desc_timer = None
+        self._best_train_area = 0      # Area del mejor frame lateral/trasero
+        self._best_train_frame = None  # Frame con numero mas cercano
+        self._best_train_cls = None    # Clase del mejor frame
+        # Arrancar hilo OCR
+        threading.Thread(target=self._ocr_worker, daemon=True).start()
+        print("[INFO] Hilo OCR separado iniciado.")
 
     def _cerrar_track(self, track, duracion):
         if track and self._track_ts:
             db_update_duracion(track['numero'], self._track_ts, duracion)
             print(f"[TRACK FIN] {track['numero']} salio de camara | Duracion: {duracion}s")
+
+            # Guardar mejor frame lateral/trasero (1 solo, el mas cercano)
+            if self._best_train_frame is not None and self._best_train_cls:
+                ts_train = datetime.now().strftime("%Y%m%d_%H%M%S")
+                cls_l = self._best_train_cls.lower()
+                train_dest = CLEAN_LATERAL_DIR if 'lateral' in cls_l else CLEAN_TRASERO_DIR
+                train_name = f"{ts_train}_{track['numero']}_{self._best_train_cls}.jpg"
+                cv2.imwrite(os.path.join(train_dest, train_name), self._best_train_frame)
+                print(f"[TRAIN] Guardado frame {self._best_train_cls} de {track['numero']}")
+
+            # Resetear tracking de frames de entrenamiento
+            self._best_train_area = 0
+            self._best_train_frame = None
+            self._best_train_cls = None
+
             with state_lock:
                 STATE["tracking"] = None
                 STATE["tracking_duracion"] = 0
             self._track_ts = None
             self._track_frame = None
 
+    def _ocr_worker(self):
+        """Hilo dedicado a OCR pesado. No bloquea el video."""
+        while self.running:
+            try:
+                job = self._ocr_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            img, crop, bbox, conf, cls_name = job
+            x1, y1, x2, y2 = bbox
+
+            try:
+                numero_leido = leer_numero(crop)
+                if not numero_leido:
+                    continue
+
+                now = time.time()
+                self._votos = [(t, n, c) for t, n, c in self._votos
+                               if now - t < VOTO_WINDOW]
+                self._votos.append((now, numero_leido, conf))
+
+                conteo = Counter(n for _, n, _ in self._votos)
+                numero_ganador, veces = conteo.most_common(1)[0]
+
+                if veces < N_VOTOS:
+                    continue
+
+                numero_leido = numero_ganador
+                self._votos = []
+
+                numero_valido, estado = validar_numero(numero_leido)
+
+                if numero_valido is None:
+                    numero_valido, estado = recuperar_ocr(numero_leido)
+
+                # -- DESCONOCIDO --
+                if numero_valido is None:
+                    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                    desc_frame_name = f"{ts_str}_DESCONOCIDA_{numero_leido}.jpg"
+                    desc_frame_path = os.path.join(DESCONOCIDAS_DIR, desc_frame_name)
+                    desc_frame_save = img.copy()
+                    cv2.putText(desc_frame_save, f"DESCONOCIDA: {numero_leido}",
+                        (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+                    cv2.imwrite(desc_frame_path, desc_frame_save)
+
+                    desc_crop_name = f"{ts_str}_DESCONOCIDA_{numero_leido}_crop.jpg"
+                    cv2.imwrite(os.path.join(DESCONOCIDAS_DIR, desc_crop_name), crop)
+
+                    # Solo guardar frames limpios lateral/trasero (delantero ya tiene suficientes)
+                    cls_l_desc = cls_name.lower()
+                    if 'lateral' in cls_l_desc or 'trasero' in cls_l_desc or 'trasera' in cls_l_desc:
+                        clean_dest = _clean_dir_for_class(cls_name)
+                        clean_name = f"{ts_str}_DESCONOCIDA_{numero_leido}_clean.jpg"
+                        cv2.imwrite(os.path.join(clean_dest, clean_name), img)
+
+                    with state_lock:
+                        STATE["descartadas"] += 1
+
+                    print(f"[DESCONOCIDA] '{numero_leido}'")
+
+                    if self._pending_desc_timer:
+                        self._pending_desc_timer.cancel()
+
+                    ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self._pending_desc = (desc_frame_path, numero_leido, conf, ts_now)
+
+                    def _enviar_si_no_cancelada(datos):
+                        fp, num, cnf, ts = datos
+                        print(f"[DESCONOCIDA -> Telegram] '{num}' sin correccion tras 4s")
+                        alerta_unidad_desconocida(fp, num, cnf, ts)
+                        self._pending_desc = None
+
+                    self._pending_desc_timer = threading.Timer(
+                        4.0, _enviar_si_no_cancelada, args=[self._pending_desc])
+                    self._pending_desc_timer.daemon = True
+                    self._pending_desc_timer.start()
+                    continue
+
+                # -- NUMERO VALIDO -> TRACKER --
+                if self._pending_desc_timer:
+                    self._pending_desc_timer.cancel()
+                    self._pending_desc_timer = None
+                    if self._pending_desc:
+                        print(f"[DEBOUNCE] Cancelada DESCONOCIDA '{self._pending_desc[1]}' -> correcta: {numero_valido}")
+                        self._pending_desc = None
+
+                with self._tracker_lock:
+                    track_result = self.tracker.update(bbox, numero_valido, estado, conf)
+
+                if track_result == 'TRACKING':
+                    continue
+
+                # -- NEW -> Bus nuevo --
+                ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                frame_name = f"{ts_str}_{numero_valido}.jpg"
+                frame_path = os.path.join(FRAMES_DIR, frame_name)
+                frame_save = img.copy()
+                cv2.putText(frame_save, numero_valido,
+                    (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+                cv2.rectangle(frame_save, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.imwrite(frame_path, frame_save)
+
+                crop_name = f"{ts_str}_{numero_valido}_crop.jpg"
+                cv2.imwrite(os.path.join(CROPS_DIR, crop_name), crop)
+
+                # Solo guardar frames limpios lateral/trasero (delantero ya tiene suficientes)
+                cls_l_save = cls_name.lower()
+                if 'lateral' in cls_l_save or 'trasero' in cls_l_save or 'trasera' in cls_l_save:
+                    clean_dest = _clean_dir_for_class(cls_name)
+                    clean_name = f"{ts_str}_{numero_valido}_clean.jpg"
+                    cv2.imwrite(os.path.join(clean_dest, clean_name), img)
+
+                self._track_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self._track_frame = frame_name
+
+                with state_lock:
+                    STATE["numero"] = numero_valido
+                    STATE["conf"]   = round(conf, 3)
+                    STATE["ts"]     = self._track_ts
+                    STATE["total_detecciones"] += 1
+                    STATE["tracking"] = numero_valido
+                    STATE["tracking_duracion"] = 0
+
+                db_insert(numero_leido, numero_valido, conf, frame_name, estado, duracion=0)
+                print(f"[NEW {estado}] {numero_valido} | Conf: {conf:.2f} | TRACKING iniciado")
+
+                ts_now = self._track_ts
+                threading.Thread(
+                    target=alerta_unidad_detectada,
+                    args=(frame_path, numero_valido, conf, ts_now),
+                    daemon=True
+                ).start()
+
+            except Exception as e:
+                print(f"[OCR ERROR] {e}")
+
     def update(self):
+        """Hilo principal: YOLO + video. Siempre rapido, nunca espera OCR."""
         while self.running:
             img = self.vs.get_frame()
             if img is None:
@@ -668,33 +838,32 @@ class InferenceStream:
                         with _unidades_lock:
                             STATE["unidades_registradas"] = len(UNIDADES)
 
-                # Verificar si el bus rastreado se fue
-                gone_track, gone_dur = self.tracker.check_gone()
+                # Verificar si el bus rastreado se fue (ligero)
+                with self._tracker_lock:
+                    gone_track, gone_dur = self.tracker.check_gone()
                 if gone_track:
                     self._cerrar_track(gone_track, gone_dur)
 
-                # Actualizar duracion en STATE
-                if self.tracker.active:
-                    with state_lock:
-                        STATE["tracking"] = self.tracker.active['numero']
-                        STATE["tracking_duracion"] = self.tracker.get_duration()
+                # Actualizar duracion en STATE (ligero)
+                with self._tracker_lock:
+                    if self.tracker.active:
+                        with state_lock:
+                            STATE["tracking"] = self.tracker.active['numero']
+                            STATE["tracking_duracion"] = self.tracker.get_duration()
 
+                # Encolar crops para OCR (no bloquea)
                 for box in results[0].boxes:
                     conf = float(box.conf[0])
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     bbox = (x1, y1, x2, y2)
 
-                    # Nombre de clase YOLO (num_delantero, num_trasero, num_lateral)
                     cls_id = int(box.cls[0])
                     cls_name = model.names.get(cls_id, "numero")
 
-                    # Filtro de aspecto: rechazar crops demasiado anchos (letreros, anuncios)
                     box_w, box_h = x2 - x1, y2 - y1
                     aspect = box_w / max(box_h, 1)
                     if aspect > 3.0 or aspect < 0.2:
                         continue
-
-                    # Filtro de tamaño: esperar a que el bus este cerca para leer
                     if box_h < 40 or box_w < 40:
                         continue
 
@@ -703,135 +872,22 @@ class InferenceStream:
                     crop = img[max(0, y1-pad_y):min(h_img, y2+pad_y),
                                max(0, x1-pad_x):min(w_img, x2+pad_x)]
 
-                    numero_leido = leer_numero(crop)
-                    if not numero_leido:
-                        continue
+                    # Rastrear mejor frame lateral/trasero (el mas grande = mas cerca)
+                    cls_lower = cls_name.lower()
+                    if 'lateral' in cls_lower or 'trasero' in cls_lower or 'trasera' in cls_lower:
+                        box_area = box_w * box_h
+                        if box_area > self._best_train_area:
+                            self._best_train_area = box_area
+                            self._best_train_frame = img.copy()
+                            self._best_train_cls = cls_name
 
-                    self._votos = [(t, n, c) for t, n, c in self._votos
-                                   if time.time() - t < VOTO_WINDOW]
-                    self._votos.append((time.time(), numero_leido, conf))
+                    try:
+                        self._ocr_queue.put_nowait(
+                            (img.copy(), crop.copy(), bbox, conf, cls_name))
+                    except queue.Full:
+                        pass  # OCR atrasado, descartar (el siguiente frame lo atrapa)
 
-                    conteo = Counter(n for _, n, _ in self._votos)
-                    numero_ganador, veces = conteo.most_common(1)[0]
-
-                    if veces < N_VOTOS:
-                        cv2.putText(annotated, f"? {numero_leido} ({veces}/{N_VOTOS})",
-                            (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 165, 0), 2)
-                        continue
-
-                    numero_leido = numero_ganador
-                    self._votos = []
-
-                    numero_valido, estado = validar_numero(numero_leido)
-
-                    # Recuperacion OCR: si fallo, intentar corregir patrones comunes
-                    if numero_valido is None:
-                        numero_valido, estado = recuperar_ocr(numero_leido)
-
-                    # -- DESCONOCIDO --
-                    if numero_valido is None:
-                        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-                        desc_frame_name = f"{ts_str}_DESCONOCIDA_{numero_leido}.jpg"
-                        desc_frame_path = os.path.join(DESCONOCIDAS_DIR, desc_frame_name)
-                        desc_frame_save = annotated.copy()
-                        cv2.putText(desc_frame_save, f"DESCONOCIDA: {numero_leido}",
-                            (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-                        cv2.imwrite(desc_frame_path, desc_frame_save)
-
-                        desc_crop_name = f"{ts_str}_DESCONOCIDA_{numero_leido}_crop.jpg"
-                        cv2.imwrite(os.path.join(DESCONOCIDAS_DIR, desc_crop_name), crop)
-
-                        clean_dest = _clean_dir_for_class(cls_name)
-                        clean_name = f"{ts_str}_DESCONOCIDA_{numero_leido}_clean.jpg"
-                        cv2.imwrite(os.path.join(clean_dest, clean_name), img)
-
-                        with state_lock:
-                            STATE["descartadas"] += 1
-
-                        print(f"[DESCONOCIDA] '{numero_leido}' guardada en unidades_desconocidas/")
-
-                        if self._pending_desc_timer:
-                            self._pending_desc_timer.cancel()
-
-                        ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        self._pending_desc = (desc_frame_path, numero_leido, conf, ts_now)
-
-                        def _enviar_si_no_cancelada(datos):
-                            fp, num, cnf, ts = datos
-                            print(f"[DESCONOCIDA -> Telegram] '{num}' sin correccion tras 4s")
-                            alerta_unidad_desconocida(fp, num, cnf, ts)
-                            self._pending_desc = None
-
-                        self._pending_desc_timer = threading.Timer(
-                            4.0, _enviar_si_no_cancelada, args=[self._pending_desc])
-                        self._pending_desc_timer.daemon = True
-                        self._pending_desc_timer.start()
-
-                        cv2.putText(annotated, f"X {numero_leido}",
-                            (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-                        continue
-
-                    # -- NUMERO VALIDO -> TRACKER --
-                    # Cancelar alerta DESCONOCIDA pendiente
-                    if self._pending_desc_timer:
-                        self._pending_desc_timer.cancel()
-                        self._pending_desc_timer = None
-                        if self._pending_desc:
-                            print(f"[DEBOUNCE] Cancelada alerta DESCONOCIDA '{self._pending_desc[1]}' -> lectura correcta: {numero_valido}")
-                            self._pending_desc = None
-
-                    track_result = self.tracker.update(bbox, numero_valido, estado, conf)
-
-                    if track_result == 'TRACKING':
-                        # Mismo bus -> solo dibujar, NO guardar, NO alertar
-                        dur = self.tracker.get_duration()
-                        cv2.putText(annotated, f"{numero_valido} [{dur:.0f}s]",
-                            (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-                        continue
-
-                    # -- NEW -> Bus nuevo --
-                    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-                    frame_name = f"{ts_str}_{numero_valido}.jpg"
-                    frame_path = os.path.join(FRAMES_DIR, frame_name)
-                    frame_save = annotated.copy()
-                    cv2.putText(frame_save, numero_valido,
-                        (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-                    cv2.imwrite(frame_path, frame_save)
-
-                    crop_name = f"{ts_str}_{numero_valido}_crop.jpg"
-                    cv2.imwrite(os.path.join(CROPS_DIR, crop_name), crop)
-
-                    clean_dest = _clean_dir_for_class(cls_name)
-                    clean_name = f"{ts_str}_{numero_valido}_clean.jpg"
-                    cv2.imwrite(os.path.join(clean_dest, clean_name), img)
-
-                    self._track_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    self._track_frame = frame_name
-
-                    with state_lock:
-                        STATE["numero"] = numero_valido
-                        STATE["conf"]   = round(conf, 3)
-                        STATE["ts"]     = self._track_ts
-                        STATE["total_detecciones"] += 1
-                        STATE["tracking"] = numero_valido
-                        STATE["tracking_duracion"] = 0
-
-                    db_insert(numero_leido, numero_valido, conf, frame_name, estado, duracion=0)
-                    print(f"[NEW {estado}] {numero_valido} | Conf: {conf:.2f} | TRACKING iniciado")
-
-                    ts_now = self._track_ts
-                    threading.Thread(
-                        target=alerta_unidad_detectada,
-                        args=(frame_path, numero_valido, conf, ts_now),
-                        daemon=True
-                    ).start()
-
-                    cv2.putText(annotated, f"{numero_valido} [0s]",
-                        (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-
-                # -- Overlay --
+                # -- Overlay ligero (solo info, sin numeros OCR) --
                 cv2.putText(annotated, f"FPS: {self.fps:.1f}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 cv2.putText(annotated, datetime.now().strftime("%H:%M:%S"),
@@ -842,12 +898,14 @@ class InferenceStream:
                 cv2.putText(annotated, pg_text,
                     (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, pg_color, 2)
 
-                if self.tracker.active:
-                    dur = self.tracker.get_duration()
-                    track_text = f"TRACK: {self.tracker.active['numero']} | {dur:.0f}s en camara"
-                    cv2.putText(annotated, track_text,
-                        (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                with self._tracker_lock:
+                    if self.tracker.active:
+                        dur = self.tracker.get_duration()
+                        track_text = f"TRACK: {self.tracker.active['numero']} | {dur:.0f}s en camara"
+                        cv2.putText(annotated, track_text,
+                            (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
+                # Empujar a HLS INMEDIATAMENTE (video nunca se congela)
                 with self.lock: self.result = annotated
                 with hls_lock: hls_push_frame(annotated)
 
@@ -860,6 +918,8 @@ class InferenceStream:
 
     def stop(self):
         self.running = False
+        if self.cap:
+            self.cap.release()
 
 
 # ==============================================================================
