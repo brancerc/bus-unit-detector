@@ -1,9 +1,6 @@
 """
 CISA - Configuración centralizada
-Todas las constantes, credenciales, rutas y parámetros en un solo lugar.
-Modificar este archivo para cambios de IPs, tokens, rutas, etc.
 """
-
 import os
 
 # ==============================================================================
@@ -37,7 +34,6 @@ CLEAN_LATERAL_DIR  = os.path.join(CLEAN_DIR, "numeroslaterales")
 CLEAN_TRASERO_DIR  = os.path.join(CLEAN_DIR, "numerostraseros")
 DB_PATH          = "/home/cisa/Documents/ProyectoIA/detecciones.db"
 
-# Crear directorios automaticamente
 for d in [HLS_DIR, FRAMES_DIR, DESCONOCIDAS_DIR, CROPS_DIR,
           CLEAN_DIR, CLEAN_LATERAL_DIR, CLEAN_TRASERO_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -54,34 +50,26 @@ PG_CONFIG = {
 }
 
 # ==============================================================================
-# MODELO / DETECCION
+# MODELO / DETECCION (Ajustes de precisión)
 # ==============================================================================
-MODEL_PATH     = "best.engine"
-MODEL_CONF     = 0.70       # Subido de 0.50 → elimina falsos (Pepsi, camiones, letreros)
-COOLDOWN_SEG   = 2.0
-N_VOTOS        = 2
-VOTO_WINDOW    = 2.0
-OCR_TARGET_H   = 160        # Subido de 120 → mas pixeles para Tesseract
-OCR_MIN_SIZE   = 15
-OCR_MAX_DIGITS = 4
-OCR_MIN_DIGITS = 3
+MODEL_PATH      = "best.engine"
+MODEL_CONF      = 0.70  
+COOLDOWN_SEG    = 2.0
+N_VOTOS         = 3      # Subido de 2 -> Requiere más consistencia
+VOTO_WINDOW     = 4.0    # Subido de 2.0 -> Ventana de tiempo más amplia para promediar
+OCR_TARGET_H    = 160    
+OCR_MIN_SIZE    = 15
+OCR_MAX_DIGITS  = 4
+OCR_MIN_DIGITS  = 3
 LEVENSHTEIN_MAX = 1
-ID_PUERTA       = 1        # Identificador de la puerta/camara actual
+ID_PUERTA       = 1
 
 # ==============================================================================
-# HLS STREAMING
+# HLS / FLASK / REFRESH
 # ==============================================================================
 HLS_TIMEOUT    = 15
 HLS_RESOLUTION = (704, 480)
 HLS_FPS        = 15
-
-# ==============================================================================
-# SERVIDOR FLASK
-# ==============================================================================
-FLASK_HOST = "0.0.0.0"
-FLASK_PORT = 5001
-
-# ==============================================================================
-# REFRESCO DE UNIDADES (segundos)
-# ==============================================================================
+FLASK_HOST     = "0.0.0.0"
+FLASK_PORT     = 5001
 PG_REFRESH_INTERVAL = 60
