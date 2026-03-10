@@ -67,20 +67,27 @@ class SimpleTracker:
         if self.active:
             overlap  = self.iou(bbox, self.active['bbox'])
             same_num = (numero == self.active['numero'])
+
             if overlap > self.IOU_THRESHOLD or same_num:
                 self.active['bbox']      = bbox
                 self.active['last_seen'] = now
                 if conf > self.active['conf']:
                     self.active['conf'] = conf
                 return 'TRACKING'
+
         self.active = {
-            'numero': numero, 'estado': estado, 'conf': conf,
-            'bbox': bbox, 'first_seen': now, 'last_seen': now,
+            'numero':     numero,
+            'estado':     estado,
+            'conf':       conf,
+            'bbox':       bbox,
+            'first_seen': now,
+            'last_seen':  now,
         }
         return 'NEW'
 
     def check_gone(self):
-        if self.active is None: return None, 0
+        if self.active is None:
+            return None, 0
         elapsed = time.time() - self.active['last_seen']
         if elapsed > self.GONE_TIMEOUT:
             duration = self.active['last_seen'] - self.active['first_seen']
@@ -90,10 +97,12 @@ class SimpleTracker:
         return None, 0
 
     def get_duration(self):
-        return round(time.time() - self.active['first_seen'], 1) if self.active else 0
+        if self.active is None:
+            return 0
+        return round(time.time() - self.active['first_seen'], 1)
 
 # ==============================================================================
-# Gestión de Base de Datos (PG y SQLite)
+# Gestión de Base de Datos
 # ==============================================================================
 
 UNIDADES = set()
@@ -108,12 +117,14 @@ def cargar_unidades_pg():
         cur.execute("SELECT no_economico FROM unidad WHERE estado = true")
         nuevas = set(str(row[0]).strip() for row in cur.fetchall())
         cur.close(); con.close()
-        with _unidades_lock: UNIDADES = nuevas
+        with _unidades_lock:
+            UNIDADES = nuevas
         _pg_connected = True
         return True
     except Exception as e:
         _pg_connected = False
-        print(f"[PG ERROR] {e}"); return False
+        print(f"[PG ERROR] {e}")
+        return False
 
 def _refresh_unidades_loop():
     while True:
@@ -141,19 +152,53 @@ def init_db():
     """)
     con.commit(); con.close()
 
-init_db()
-
 def db_insert(no_detectado, no_economico, confianza, captura_url=None, estado="VERIFICADO", duracion=0):
     now = datetime.now()
     try:
         con = sqlite3.connect(DB_PATH)
-        con.execute("INSERT INTO evento_paso (no_detectado, no_economico, direccion, hora_paso, id_puerta, hora_registro, captura_url, estado, confianza, duracion_camara) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (no_detectado, no_economico, "entrada", now.strftime("%Y-%m-%d %H:%M:%S"), ID_PUERTA, now.strftime("%Y-%m-%d %H:%M:%S"), captura_url, estado, round(confianza, 3), round(duracion, 1)))
+        con.execute("""INSERT INTO evento_paso (no_detectado, no_economico, direccion, hora_paso, id_puerta,
+                       hora_registro, captura_url, estado, confianza, duracion_camara)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (no_detectado, no_economico, "entrada", now.strftime("%Y-%m-%d %H:%M:%S"), ID_PUERTA,
+                     now.strftime("%Y-%m-%d %H:%M:%S"), captura_url, estado, round(confianza, 3), round(duracion, 1)))
         con.commit(); con.close()
-    except Exception as e: print(f"[DB ERROR] {e}")
+    except Exception as e:
+        print(f"[DB ERROR] {e}")
+
+def db_update_duracion(no_economico, hora_paso, duracion):
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("UPDATE evento_paso SET duracion_camara=? WHERE no_economico=? AND hora_paso=?",
+                    (round(duracion, 1), no_economico, hora_paso))
+        con.commit(); con.close()
+    except Exception as e:
+        print(f"[DB ERROR] update duracion: {e}")
+
+def db_query(fecha=None, limit=50):
+    try:
+        con = sqlite3.connect(DB_PATH); con.row_factory = sqlite3.Row
+        if fecha:
+            rows = con.execute("SELECT * FROM evento_paso WHERE date(hora_paso)=? ORDER BY id_evento DESC LIMIT ?", (fecha, limit)).fetchall()
+        else:
+            rows = con.execute("SELECT * FROM evento_paso ORDER BY id_evento DESC LIMIT ?", (limit,)).fetchall()
+        con.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[DB ERROR] {e}"); return []
+
+def db_stats():
+    try:
+        con = sqlite3.connect(DB_PATH); hoy = datetime.now().strftime("%Y-%m-%d")
+        total = con.execute("SELECT COUNT(*) FROM evento_paso").fetchone()[0]
+        hoy_c = con.execute("SELECT COUNT(*) FROM evento_paso WHERE date(hora_paso)=?", (hoy,)).fetchone()[0]
+        con.close()
+        return {"total": total, "hoy": hoy_c}
+    except: return {"total": 0, "hoy": 0}
+
+init_db()
 
 # ==============================================================================
-# Lógica OCR y Validación
+# Lógica OCR Mejorada
 # ==============================================================================
 
 def levenshtein(a, b):
@@ -168,7 +213,8 @@ def levenshtein(a, b):
 
 def validar_numero(leido):
     leido = leido.strip()
-    with _unidades_lock: unidades_snapshot = UNIDADES.copy()
+    with _unidades_lock:
+        unidades_snapshot = UNIDADES.copy()
     if not unidades_snapshot: return None, None
     if leido in unidades_snapshot: return leido, "VERIFICADO"
     
@@ -181,23 +227,21 @@ def validar_numero(leido):
     return None, None
 
 def recuperar_ocr(leido):
-    """
-    Intenta corregir patrones erróneos detectados en logs.
-    """
     leido = leido.strip()
-    with _unidades_lock: unidades_snapshot = UNIDADES.copy()
+    with _unidades_lock:
+        unidades_snapshot = UNIDADES.copy()
     if not unidades_snapshot: return None, None
 
-    # Error común: Tesseract lee '4' en lugar de '5' al inicio
+    # Corrección 4 -> 5 inicial (Común en ruido nocturno)
     if len(leido) == 4 and leido[0] == '4':
         candidato = '5' + leido[1:]
         if candidato in unidades_snapshot: return candidato, "CORREGIDO"
 
-    # Caso 3 dígitos: Prender el 5 inicial que suele perderse
+    # Caso 3 dígitos (Prender el 5 inicial)
     if len(leido) == 3:
         candidato = '5' + leido
         if candidato in unidades_snapshot: return candidato, "CORREGIDO"
-
+    
     return None, None
 
 def leer_numero(crop):
@@ -212,19 +256,19 @@ def leer_numero(crop):
         crop_up = cv2.resize(crop, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(crop_up, cv2.COLOR_BGR2GRAY)
         
-        # Limpieza de ruido y realce de contraste local
-        gray = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=15)
+        # Limpieza y contraste
+        gray = cv2.fastNlMeansDenoising(gray, h=10)
         clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
         gray = clahe.apply(gray)
 
-        kernel_sep = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         resultados = []
 
-        # Estrategia 1: Otsu + Apertura (Separa trazos pegados)
+        # Estrategia 1: Otsu + Apertura Morfológica para separar trazos
         _, g1 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        g1 = cv2.morphologyEx(g1, cv2.MORPH_OPEN, kernel_sep)
+        g1 = cv2.morphologyEx(g1, cv2.MORPH_OPEN, kernel)
 
-        # Estrategia 2: Adaptativo (Lidia con brillos LED)
+        # Estrategia 2: Adaptativo para lidiar con variaciones de luz
         g2 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
 
         config = '--psm 7 -c tessedit_char_whitelist=0123456789'
@@ -237,10 +281,54 @@ def leer_numero(crop):
     except: return None
 
 # ==============================================================================
+# HLS y Streaming FFmpeg
+# ==============================================================================
+
+hls_lock = threading.Lock(); hls_last_ping = 0; hls_proc = None; hls_active = False
+
+def hls_start():
+    global hls_proc, hls_active
+    if hls_active: return
+    print("[HLS] Iniciando stream...")
+    for f in glob.glob(os.path.join(HLS_DIR, "*")):
+        try: os.remove(f)
+        except: pass
+    w, h = HLS_RESOLUTION
+    cmd = [
+        'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo', '-s', f'{w}x{h}', '-pix_fmt', 'bgr24', '-r', str(HLS_FPS),
+        '-i', '-', '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-f', 'hls', '-hls_time', '2',
+        '-hls_list_size', '10', '-hls_flags', 'delete_segments+append_list', f'{HLS_DIR}/stream.m3u8'
+    ]
+    hls_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    hls_active = True
+
+def hls_stop():
+    global hls_proc, hls_active
+    if not hls_active: return
+    print("[HLS] Deteniendo stream...")
+    try: hls_proc.stdin.close(); hls_proc.wait(timeout=3)
+    except: hls_proc.kill()
+    hls_proc = None; hls_active = False
+
+def hls_watchdog():
+    while True:
+        time.sleep(5)
+        with hls_lock:
+            if hls_active and (time.time() - hls_last_ping) > HLS_TIMEOUT: hls_stop()
+
+threading.Thread(target=hls_watchdog, daemon=True).start()
+
+def hls_push_frame(frame):
+    if not hls_active or hls_proc is None: return
+    try:
+        resized = cv2.resize(frame, HLS_RESOLUTION)
+        hls_proc.stdin.write(resized.tobytes())
+    except: pass
+
+# ==============================================================================
 # Hilos de Captura e Inferencia
 # ==============================================================================
 
-model = YOLO(MODEL_PATH, task="detect")
 STATE = {"numero": None, "conf": None, "ts": None, "fps": 0.0, "pipeline": False, "total_detecciones": 0, "unidades_registradas": 0, "pg_conectada": False, "descartadas": 0, "tracking": None, "tracking_duracion": 0}
 state_lock = threading.Lock()
 
@@ -255,26 +343,30 @@ class VideoStream:
         while self.running:
             if not self.cap or not self.cap.isOpened(): self._abrir(); time.sleep(2); continue
             ret, frame = self.cap.read()
-            if ret: 
-                with self.lock: self.frame = frame
-                with state_lock: STATE["pipeline"] = True
-            else: with state_lock: STATE["pipeline"] = False
+            if ret:
+                with self.lock:
+                    self.frame = frame
+                with state_lock:
+                    STATE["pipeline"] = True
+            else:
+                with state_lock:
+                    STATE["pipeline"] = False
     def get_frame(self):
         with self.lock: return self.frame.copy() if self.frame is not None else None
 
 class InferenceStream:
     def __init__(self, vs):
         self.running = True; self.vs = vs; self.tracker = SimpleTracker(); self._votos = []
+        self.model = YOLO(MODEL_PATH, task="detect")
     def update(self):
         t_fps = time.time(); cnt = 0
         while self.running:
             img = self.vs.get_frame()
             if img is None: time.sleep(0.05); continue
             try:
-                results = model.predict(img, conf=MODEL_CONF, device=0, verbose=False)
+                results = self.model.predict(img, conf=MODEL_CONF, device=0, verbose=False)
                 annotated = results[0].plot()
                 
-                # Gestión de FPS
                 cnt += 1
                 if time.time() - t_fps >= 1.0:
                     with state_lock: STATE["fps"] = round(cnt / (time.time() - t_fps), 1)
@@ -286,27 +378,63 @@ class InferenceStream:
                     leido = leer_numero(crop)
                     if not leido: continue
 
-                    # Lógica de Votación
                     self._votos = [v for v in self._votos if time.time() - v[0] < VOTO_WINDOW]
                     self._votos.append((time.time(), leido))
                     ganador, veces = Counter(v[1] for v in self._votos).most_common(1)[0]
-                    if veces < N_VOTOS: continue
                     
-                    valido, est = validar_numero(ganador)
-                    if not valido: valido, est = recuperar_ocr(ganador)
-                    
-                    if valido:
-                        res = self.tracker.update((x1,y1,x2,y2), valido, est, conf)
-                        if res == 'NEW':
-                            db_insert(ganador, valido, conf, estado=est)
-                            alerta_unidad_detectada(None, valido, conf, datetime.now().strftime("%H:%M:%S"))
+                    if veces >= N_VOTOS:
+                        self._votos = []
+                        valido, est = validar_numero(ganador)
+                        if not valido: valido, est = recuperar_ocr(ganador)
+                        
+                        if valido:
+                            res = self.tracker.update((x1,y1,x2,y2), valido, est, conf)
+                            if res == 'NEW':
+                                db_insert(ganador, valido, conf, estado=est)
+                                threading.Thread(target=alerta_unidad_detectada, args=(None, valido, conf, datetime.now().strftime("%H:%M:%S")), daemon=True).start()
                 
-                with state_lock:
-                    if self.tracker.active:
-                        STATE["tracking"] = self.tracker.active['numero']
-                        STATE["tracking_duracion"] = self.tracker.get_duration()
-
+                with hls_lock: hls_push_frame(annotated)
             except Exception as e: print(f"[ERROR INF] {e}")
+
+# ==============================================================================
+# Rutas Flask
+# ==============================================================================
+
+@app.route('/')
+def index(): return HOME
+
+@app.route('/livevideo')
+def livevideo(): return DASHBOARD
+
+@app.route('/api/hls-ping')
+def api_hls_ping():
+    global hls_last_ping
+    with hls_lock:
+        hls_last_ping = time.time()
+        if not hls_active: hls_start()
+    return jsonify({"hls": "alive"})
+
+@app.route('/hls/<path:filename>')
+def hls_files(filename):
+    filepath = os.path.join(HLS_DIR, filename)
+    if not os.path.exists(filepath): return '', 404
+    return send_file(filepath)
+
+@app.route('/api/estado')
+def api_estado():
+    with state_lock: return jsonify(dict(STATE))
+
+@app.route('/api/detecciones')
+def api_detecciones():
+    return jsonify(db_query(fecha=request.args.get('fecha'), limit=int(request.args.get('limit', 50))))
+
+@app.route('/health')
+def health():
+    with state_lock: return jsonify({"status": "ok", "pipeline": STATE["pipeline"], "fps": STATE["fps"]})
+
+# ==============================================================================
+# Inicio
+# ==============================================================================
 
 vs = VideoStream(); inf = InferenceStream(vs)
 threading.Thread(target=vs.update, daemon=True).start()

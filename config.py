@@ -1,6 +1,3 @@
-"""
-CISA - Configuración centralizada
-"""
 import os
 
 # ==============================================================================
@@ -50,13 +47,13 @@ PG_CONFIG = {
 }
 
 # ==============================================================================
-# MODELO / DETECCION (Ajustes de precisión)
+# MODELO / DETECCION (Mejoras de Votación)
 # ==============================================================================
 MODEL_PATH      = "best.engine"
 MODEL_CONF      = 0.70  
 COOLDOWN_SEG    = 2.0
-N_VOTOS         = 3      # Subido de 2 -> Requiere más consistencia
-VOTO_WINDOW     = 4.0    # Subido de 2.0 -> Ventana de tiempo más amplia para promediar
+N_VOTOS         = 3      # Subido de 2 para mayor estabilidad
+VOTO_WINDOW     = 4.0    # Ventana amplia para promediar lecturas
 OCR_TARGET_H    = 160    
 OCR_MIN_SIZE    = 15
 OCR_MAX_DIGITS  = 4
@@ -65,7 +62,7 @@ LEVENSHTEIN_MAX = 1
 ID_PUERTA       = 1
 
 # ==============================================================================
-# HLS / FLASK / REFRESH
+# HLS / FLASK
 # ==============================================================================
 HLS_TIMEOUT    = 15
 HLS_RESOLUTION = (704, 480)
