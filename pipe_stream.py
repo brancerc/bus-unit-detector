@@ -1,3 +1,7 @@
+"""
+CISA - Sistema de Detección y Monitoreo de Unidades de Transporte
+"""
+
 import cv2
 import glob
 import threading
@@ -14,21 +18,22 @@ from ultralytics import YOLO
 from flask import Flask, send_file, jsonify, request, make_response
 
 from config import (
-    PIPELINE, HLS_DIR, FRAMES_DIR, DESCONOCIDAS_DIR, CROPS_DIR, CLEAN_DIR,
-    CLEAN_LATERAL_DIR, CLEAN_TRASERO_DIR, DB_PATH,
-    PG_CONFIG, MODEL_PATH, MODEL_CONF, COOLDOWN_SEG, N_VOTOS, VOTO_WINDOW,
+    PIPELINE, HLS_DIR, FRAMES_DIR, DB_PATH,
+    PG_CONFIG, MODEL_PATH, MODEL_CONF, N_VOTOS, VOTO_WINDOW,
     OCR_TARGET_H, OCR_MIN_SIZE, OCR_MAX_DIGITS, OCR_MIN_DIGITS,
     LEVENSHTEIN_MAX, ID_PUERTA, HLS_TIMEOUT, HLS_RESOLUTION, HLS_FPS,
     FLASK_HOST, FLASK_PORT, PG_REFRESH_INTERVAL
 )
-from alertas import alerta_unidad_detectada, alerta_unidad_desconocida
+from alertas import alerta_unidad_detectada
 
 app = Flask(__name__)
 
 # Cargar templates HTML
 TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
-with open(os.path.join(TEMPLATE_DIR, "home.html"), encoding="utf-8") as f: HOME = f.read()
-with open(os.path.join(TEMPLATE_DIR, "dashboard.html"), encoding="utf-8") as f: DASHBOARD = f.read()
+with open(os.path.join(TEMPLATE_DIR, "home.html"), encoding="utf-8") as f: 
+    HOME = f.read()
+with open(os.path.join(TEMPLATE_DIR, "dashboard.html"), encoding="utf-8") as f: 
+    DASHBOARD = f.read()
 
 # ==============================================================================
 # Tracker Simple
@@ -36,7 +41,8 @@ with open(os.path.join(TEMPLATE_DIR, "dashboard.html"), encoding="utf-8") as f: 
 class SimpleTracker:
     IOU_THRESHOLD = 0.20
     GONE_TIMEOUT  = 3.0
-    def __init__(self): self.active = None
+    def __init__(self): 
+        self.active = None
 
     @staticmethod
     def iou(a, b):
@@ -66,22 +72,35 @@ class SimpleTracker:
         return None, 0
 
 # ==============================================================================
-# Bases de Datos (Strict Mode)
+# Bases de Datos (Validación Estricta)
 # ==============================================================================
-UNIDADES = set(); _unidades_lock = threading.Lock(); _pg_connected = False
+UNIDADES = set()
+_unidades_lock = threading.Lock()
+_pg_connected = False
 
 def cargar_unidades_pg():
     global UNIDADES, _pg_connected
     try:
-        con = psycopg2.connect(**PG_CONFIG); cur = con.cursor()
+        con = psycopg2.connect(**PG_CONFIG)
+        cur = con.cursor()
         cur.execute("SELECT no_economico FROM unidad WHERE estado = true")
-        UNIDADES = set(str(row[0]).strip() for row in cur.fetchall())
-        cur.close(); con.close(); _pg_connected = True
+        nuevas = set(str(row[0]).strip() for row in cur.fetchall())
+        cur.close(); con.close()
+        with _unidades_lock:
+            UNIDADES = nuevas
+        _pg_connected = True
         return True
     except Exception as e:
-        _pg_connected = False; print(f"[PG ERROR] {e}"); return False
+        _pg_connected = False
+        print(f"[PG ERROR] {e}")
+        return False
 
-threading.Thread(target=lambda: (time.sleep(i) or cargar_unidades_pg() for i in iter(lambda: PG_REFRESH_INTERVAL, None)), daemon=True).start()
+def _refresh_unidades_loop():
+    while True:
+        cargar_unidades_pg()
+        time.sleep(PG_REFRESH_INTERVAL)
+
+threading.Thread(target=_refresh_unidades_loop, daemon=True).start()
 
 def init_db():
     con = sqlite3.connect(DB_PATH)
@@ -94,7 +113,8 @@ def db_insert(no_det, no_eco, conf, url, est, dur=0):
         con = sqlite3.connect(DB_PATH)
         con.execute("INSERT INTO evento_paso (no_detectado, no_economico, direccion, hora_paso, id_puerta, hora_registro, captura_url, estado, confianza, duracion_camara) VALUES (?,?,?,?,?,?,?,?,?,?)", (no_det, no_eco, "entrada", now, ID_PUERTA, now, url, est, round(conf, 3), round(dur, 1)))
         con.commit(); con.close()
-    except Exception as e: print(f"[DB ERROR] {e}")
+    except Exception as e: 
+        print(f"[DB ERROR] {e}")
 
 init_db()
 
@@ -122,20 +142,25 @@ def leer_numero(crop):
             clean = re.sub(r'[^0-9]', '', t)[:OCR_MAX_DIGITS]
             if len(clean) >= OCR_MIN_DIGITS: res.append(clean)
         return Counter(res).most_common(1)[0][0] if res else None
-    except: return None
+    except: 
+        return None
 
 def validar_numero(leido):
-    with _unidades_lock: snapshot = UNIDADES.copy()
-    if not snapshot: return None, None # BLOQUEO: Si PG está caída, no valida nada
-    if leido in snapshot: return leido, "VERIFICADO"
+    with _unidades_lock: 
+        snapshot = UNIDADES.copy()
+    if not snapshot: 
+        return None, None
+    if leido in snapshot: 
+        return leido, "VERIFICADO"
     
-    # Levenshtein strict match
     match = next((u for u in snapshot if len(u) == len(leido) and levenshtein(leido, u) <= LEVENSHTEIN_MAX), None)
     return (match, "CORREGIDO") if match else (None, None)
 
 def recuperar_ocr(leido):
-    with _unidades_lock: snapshot = UNIDADES.copy()
-    if not snapshot: return None, None
+    with _unidades_lock: 
+        snapshot = UNIDADES.copy()
+    if not snapshot: 
+        return None, None
     if len(leido) == 4 and leido[0] == '4':
         c = '5' + leido[1:]
         if c in snapshot: return c, "CORREGIDO"
@@ -148,7 +173,8 @@ def levenshtein(a, b):
     m, n = len(a), len(b); dp = list(range(n + 1))
     for i in range(1, m + 1):
         prev = dp[:]; dp[0] = i
-        for j in range(1, n + 1): dp[j] = prev[j-1] if a[i-1] == b[j-1] else 1 + min(prev[j], dp[j-1], prev[j-1])
+        for j in range(1, n + 1): 
+            dp[j] = prev[j-1] if a[i-1] == b[j-1] else 1 + min(prev[j], dp[j-1], prev[j-1])
     return dp[n]
 
 # ==============================================================================
@@ -167,14 +193,26 @@ def hls_start():
     hls_active = True
 
 def hls_watchdog():
+    global hls_active, hls_proc # CORRECCIÓN: Declaración global al inicio
     while True:
         time.sleep(5)
         with hls_lock:
             if hls_active and (time.time() - hls_last_ping > HLS_TIMEOUT):
-                if hls_proc: hls_proc.kill()
-                global hls_active; hls_active = False
+                if hls_proc: 
+                    hls_proc.kill()
+                    hls_proc = None
+                hls_active = False
+                print("[HLS] Stream detenido por inactividad.")
 
 threading.Thread(target=hls_watchdog, daemon=True).start()
+
+def hls_push_frame(frame):
+    if not hls_active or hls_proc is None: return
+    try:
+        resized = cv2.resize(frame, HLS_RESOLUTION)
+        hls_proc.stdin.write(resized.tobytes())
+    except: 
+        pass
 
 # ==============================================================================
 # Hilos de Procesamiento
@@ -183,7 +221,8 @@ STATE = {"numero":None, "conf":0, "fps":0, "pipeline":False, "tracking":None, "t
 state_lock = threading.Lock()
 
 class VideoStream:
-    def __init__(self): self.lock = threading.Lock(); self.frame = None; self.running = True; self.cap = None
+    def __init__(self): 
+        self.lock = threading.Lock(); self.frame = None; self.running = True; self.cap = None
     def update(self):
         while self.running:
             if not self.cap or not self.cap.isOpened():
@@ -191,15 +230,17 @@ class VideoStream:
                 time.sleep(2); continue
             ret, frame = self.cap.read()
             if ret:
-                with self.lock: self.frame = frame
-                with state_lock: STATE["pipeline"] = True
+                with self.lock:
+                    self.frame = frame
+                with state_lock:
+                    STATE["pipeline"] = True
             else:
-                with state_lock: STATE["pipeline"] = False
-    def get_frame(self):
-        with self.lock: return self.frame.copy() if self.frame is not None else None
+                with state_lock:
+                    STATE["pipeline"] = False
 
 class InferenceStream:
-    def __init__(self, vs): self.vs = vs; self.running = True; self.model = YOLO(MODEL_PATH, task="detect"); self.tracker = SimpleTracker(); self._votos = []
+    def __init__(self, vs): 
+        self.vs = vs; self.running = True; self.model = YOLO(MODEL_PATH, task="detect"); self.tracker = SimpleTracker(); self._votos = []
     def update(self):
         t_fps = time.time(); cnt = 0
         while self.running:
@@ -237,8 +278,7 @@ class InferenceStream:
 
             with hls_lock:
                 if hls_active:
-                    try: hls_proc.stdin.write(cv2.resize(annotated, HLS_RESOLUTION).tobytes())
-                    except: pass
+                    hls_push_frame(annotated)
 
 vs = VideoStream(); inf = InferenceStream(vs)
 threading.Thread(target=vs.update, daemon=True).start()
@@ -253,7 +293,10 @@ def index(): return HOME
 def livevideo(): return DASHBOARD
 @app.route('/api/hls-ping')
 def hls_ping():
-    with hls_lock: global hls_last_ping; hls_last_ping = time.time(); hls_start()
+    global hls_last_ping
+    with hls_lock: 
+        hls_last_ping = time.time()
+        hls_start()
     return jsonify({"hls": "alive"})
 @app.route('/hls/<path:f>')
 def hls_files(f): return send_file(os.path.join(HLS_DIR, f))
