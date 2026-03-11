@@ -36,24 +36,24 @@ for d in [HLS_DIR, FRAMES_DIR, DESCONOCIDAS_DIR, CROPS_DIR,
     os.makedirs(d, exist_ok=True)
 
 # ==============================================================================
-# POSTGRESQL
+# POSTGRESQL (Revisar credenciales)
 # ==============================================================================
 PG_CONFIG = {
     "host":     "localhost",
     "port":     5432,
     "dbname":   "postgres",
     "user":     "postgres",
-    "password": "",
+    "password": "", # <--- Asegúrate de que sea correcta
 }
 
 # ==============================================================================
-# MODELO / DETECCION (Mejoras de Votación)
+# MODELO / DETECCION
 # ==============================================================================
 MODEL_PATH      = "best.engine"
 MODEL_CONF      = 0.70  
 COOLDOWN_SEG    = 2.0
-N_VOTOS         = 3      # Subido de 2 para mayor estabilidad
-VOTO_WINDOW     = 4.0    # Ventana amplia para promediar lecturas
+N_VOTOS         = 3      
+VOTO_WINDOW     = 4.0    
 OCR_TARGET_H    = 160    
 OCR_MIN_SIZE    = 15
 OCR_MAX_DIGITS  = 4
