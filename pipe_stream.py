@@ -1,3 +1,7 @@
+"""
+CISA - Sistema de Detección y Monitoreo de Unidades de Transporte
+Pipeline: RTSP → GStreamer → YOLO → OCR → Validación PG → Tracking → Alertas
+"""
 
 import cv2
 import glob
@@ -312,6 +316,15 @@ def levenshtein(a, b):
 
 
 def validar_numero(leido):
+    """
+    Valida contra PG con prioridad: 4 digitos > 3 digitos.
+    Patron OCR: Tesseract pierde el '0' (segundo digito): 5038→538, 5009→509
+    Estrategia:
+      1. Si 4 digitos con 5: buscar directo
+      2. Si 3 digitos con 5: insertar '0' pos 1 → buscar 50xx primero
+      3. Si 4-dig no matchea: fallback a 3-dig real en PG
+      4. Si 4 digitos sin 5: forzar primer digito '5'
+    """
     leido = leido.strip()
 
     with _unidades_lock:
@@ -321,23 +334,83 @@ def validar_numero(leido):
         print(f"[DESCARTADO] '{leido}' — lista PG vacia")
         return None, None
 
+    unidades_4d5 = {u for u in unidades_snapshot if len(u) == 4 and u.startswith('5')}
+
+    # =============================================
+    # CASO 1: Ya es 4 digitos empezando con 5 → match directo
+    # =============================================
+    if len(leido) == 4 and leido.startswith('5'):
+        if leido in unidades_4d5:
+            print(f"[VERIFICADO] '{leido}' existe en PostgreSQL")
+            return leido, "VERIFICADO"
+        # Levenshtein
+        mejor, mejor_dist = None, 999
+        for u in unidades_4d5:
+            d = levenshtein(leido, u)
+            if d < mejor_dist:
+                mejor_dist = d; mejor = u
+        if mejor_dist <= LEVENSHTEIN_MAX:
+            print(f"[CORREGIDO] '{leido}' -> '{mejor}' (Lev={mejor_dist})")
+            return mejor, "CORREGIDO"
+        print(f"[DESCARTADO] '{leido}' sin match 4dig (mejor: {mejor}, dist={mejor_dist})")
+        return None, None
+
+    # =============================================
+    # CASO 2: 3 digitos empezando con 5 → PRIORIDAD: insertar 0 → 50xx
+    # =============================================
+    if len(leido) == 3 and leido[0] == '5':
+        candidato_4d = leido[0] + '0' + leido[1:]  # 538 → 5038
+
+        # Intentar match 4 digitos primero (PRIORIDAD)
+        if candidato_4d in unidades_4d5:
+            print(f"[CORREGIDO] OCR '{leido}' -> '{candidato_4d}' (insertar 0, existe en PG)")
+            return candidato_4d, "CORREGIDO"
+        # Levenshtein sobre 4 digitos
+        mejor, mejor_dist = None, 999
+        for u in unidades_4d5:
+            d = levenshtein(candidato_4d, u)
+            if d < mejor_dist:
+                mejor_dist = d; mejor = u
+        if mejor_dist <= LEVENSHTEIN_MAX:
+            print(f"[CORREGIDO] OCR '{leido}' -> '{candidato_4d}' -> '{mejor}' (Lev={mejor_dist})")
+            return mejor, "CORREGIDO"
+
+        # Fallback: aceptar como 3-digitos real si existe en PG
+        if leido in unidades_snapshot:
+            print(f"[VERIFICADO] '{leido}' existe como 3-dig en PG (sin match 4dig)")
+            return leido, "VERIFICADO"
+
+        print(f"[DESCARTADO] '{leido}' -> '{candidato_4d}' sin match 4dig ni 3dig")
+        return None, None
+
+    # =============================================
+    # CASO 3: 4 digitos que NO empiezan con 5 → forzar '5'
+    # =============================================
+    if len(leido) == 4 and leido[0] != '5':
+        normalizado = '5' + leido[1:]
+        print(f"[NORMALIZADO] '{leido}' -> '{normalizado}' (primer dig -> 5)")
+        if normalizado in unidades_4d5:
+            print(f"[CORREGIDO] '{leido}' -> '{normalizado}' (existe en PG)")
+            return normalizado, "CORREGIDO"
+        mejor, mejor_dist = None, 999
+        for u in unidades_4d5:
+            d = levenshtein(normalizado, u)
+            if d < mejor_dist:
+                mejor_dist = d; mejor = u
+        if mejor_dist <= LEVENSHTEIN_MAX:
+            print(f"[CORREGIDO] '{leido}' -> '{normalizado}' -> '{mejor}' (Lev={mejor_dist})")
+            return mejor, "CORREGIDO"
+        print(f"[DESCARTADO] '{leido}' -> '{normalizado}' sin match")
+        return None, None
+
+    # =============================================
+    # CASO 4: 3 digitos sin 5 u otros formatos → intentar como esta
+    # =============================================
     if leido in unidades_snapshot:
-        print(f"[VERIFICADO] '{leido}' existe en PostgreSQL")
+        print(f"[VERIFICADO] '{leido}' existe en PG")
         return leido, "VERIFICADO"
 
-    candidatos = [u for u in unidades_snapshot if len(u) == len(leido)]
-    mejor, mejor_dist = None, 999
-    for u in candidatos:
-        d = levenshtein(leido, u)
-        if d < mejor_dist:
-            mejor_dist = d
-            mejor = u
-
-    if mejor_dist <= LEVENSHTEIN_MAX:
-        print(f"[CORREGIDO] OCR '{leido}' -> BD '{mejor}' (dist={mejor_dist})")
-        return mejor, "CORREGIDO"
-
-    print(f"[DESCARTADO] '{leido}' sin match en PG (mejor: {mejor}, dist={mejor_dist})")
+    print(f"[DESCARTADO] '{leido}' formato no reconocido")
     return None, None
 
 
@@ -345,12 +418,10 @@ def validar_numero(leido):
 
 def recuperar_ocr(leido):
     """
-    Intenta recuperar lecturas OCR erroneas usando patrones conocidos:
-    1. Si lee 3 digitos, antepone '5' y valida (el 5 inicial se pierde frecuentemente)
-    2. Si lee 4 digitos con primer digito != 5, reemplaza por '5' y valida
-       (confusion tipica: 5->4, 5->1, 5->0, 5->2, 5->3)
-    3. Si lee 4 digitos con segundo digito != 0, reemplaza por '0' y valida
-       (confusion tipica: 0->5, 0->6)
+    Fallback despues de validar_numero.
+    Estrategia: forzar segundo digito a '0' (50xx).
+    Cubre el caso donde validar_numero normalizo a 5Xxx pero no matcheo.
+    Ejemplo: OCR lee '5538' → validar hizo '5538' → no match → aqui: '5038' → match!
     """
     leido = leido.strip()
 
@@ -360,35 +431,30 @@ def recuperar_ocr(leido):
     if not unidades_snapshot:
         return None, None
 
-    # Estrategia 1: 3 digitos -> anteponer '5'
-    if len(leido) == 3:
-        candidato = '5' + leido
-        if candidato in unidades_snapshot:
-            print(f"[RECUPERADO] OCR '{leido}' -> prefijo '5' -> '{candidato}'")
-            return candidato, "CORREGIDO"
-        # Tambien probar con Levenshtein sobre el candidato
-        for u in unidades_snapshot:
-            if len(u) == 4 and levenshtein(candidato, u) <= LEVENSHTEIN_MAX:
-                print(f"[RECUPERADO] OCR '{leido}' -> '5'+'{leido}' ~ '{u}' (Lev)")
-                return u, "CORREGIDO"
+    unidades_4d5 = {u for u in unidades_snapshot if len(u) == 4 and u.startswith('5')}
 
-    # Estrategia 2: 4 digitos, primer digito no es '5' -> forzar '5'
-    if len(leido) == 4 and leido[0] != '5':
-        candidato = '5' + leido[1:]
-        if candidato in unidades_snapshot:
-            print(f"[RECUPERADO] OCR '{leido}' -> primer digito '5' -> '{candidato}'")
-            return candidato, "CORREGIDO"
-        for u in unidades_snapshot:
-            if len(u) == 4 and levenshtein(candidato, u) <= LEVENSHTEIN_MAX:
-                print(f"[RECUPERADO] OCR '{leido}' -> '5'+'{leido[1:]}' ~ '{u}' (Lev)")
-                return u, "CORREGIDO"
+    # Reconstruir normalizado igual que validar_numero
+    normalizado = leido
+    if len(leido) == 3 and leido[0] == '5':
+        normalizado = leido[0] + '0' + leido[1:]
+    elif len(leido) == 3 and leido[0] != '5':
+        normalizado = '50' + leido[1:]
+    elif len(leido) == 4 and leido[0] != '5':
+        normalizado = '5' + leido[1:]
 
-    # Estrategia 3: 4 digitos, segundo digito no es '0' -> forzar '50'
-    if len(leido) == 4 and leido[0] == '5' and leido[1] != '0':
-        candidato = '50' + leido[2:]
-        if candidato in unidades_snapshot:
-            print(f"[RECUPERADO] OCR '{leido}' -> forzar '50xx' -> '{candidato}'")
+    if len(normalizado) != 4 or not normalizado.startswith('5'):
+        return None, None
+
+    # Si segundo digito no es '0', forzar '50xx'
+    if normalizado[1] != '0':
+        candidato = '50' + normalizado[2:]
+        if candidato in unidades_4d5:
+            print(f"[RECUPERADO] '{leido}' -> forzar 50xx -> '{candidato}'")
             return candidato, "CORREGIDO"
+        for u in unidades_4d5:
+            if levenshtein(candidato, u) <= LEVENSHTEIN_MAX:
+                print(f"[RECUPERADO] '{leido}' -> 50{normalizado[2:]} ~ '{u}' (Lev)")
+                return u, "CORREGIDO"
 
     return None, None
 
