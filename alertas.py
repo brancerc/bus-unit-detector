@@ -1,51 +1,69 @@
 """
-CISA - Módulo de alertas y notificaciones
-Centraliza todo el envío de mensajes a Telegram.
-Agregar aquí futuros canales: WhatsApp, email, Slack, etc.
+CISA - Modulo de alertas y notificaciones
+Flujo de validacion:
+  1. Deteccion → enviar_a_validador() con botones OK/NO
+  2. Validador presiona boton
+  3. OK → reenviar al grupo MONITOR JETSON + Swagger/JSON
+  4. NO → guardar en /revisar, descartar
 """
 
+import json
+import os
+import shutil
 import requests
-import json # <-- NUEVO: Necesario para los botones inline
-# <-- NUEVO: Agregamos TG_VALIDADOR_ID a las importaciones de config
-from config import TG_TOKEN, TG_CHAT_ID, TG_VALIDADOR_ID 
+import threading
+import time
+from config import TG_TOKEN, TG_CHAT_ID, TG_VALIDADOR_ID, REVISAR_DIR
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
+# Detecciones pendientes de validacion: {msg_id: {datos}}
+_pendientes = {}
+_pendientes_lock = threading.Lock()
 
-# ══════════════════════════════════════════════════════════════════════════════
+# Offset para polling de callbacks
+_update_offset = 0
+
+
+# ==============================================================================
 # FUNCIONES BASE
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
-def _enviar_foto(frame_path, caption):
-    """Envía una foto con caption a Telegram."""
+def _enviar_foto(chat_id, frame_path, caption, reply_markup=None):
+    """Envia una foto con caption a un chat especifico."""
     try:
+        data = {
+            "chat_id": chat_id,
+            "caption": caption,
+            "parse_mode": "Markdown"
+        }
+        if reply_markup:
+            data["reply_markup"] = reply_markup
+
         with open(frame_path, 'rb') as foto:
-            requests.post(
+            resp = requests.post(
                 f"{TG_API}/sendPhoto",
-                data={
-                    "chat_id": TG_CHAT_ID,
-                    "caption": caption,
-                    "parse_mode": "Markdown"
-                },
+                data=data,
                 files={"photo": foto},
                 timeout=15
             )
-        return True
+        result = resp.json()
+        if result.get("ok"):
+            return result["result"]["message_id"]
+        else:
+            print(f"[TELEGRAM ERROR] {result.get('description', 'unknown')}")
+            return None
     except Exception as e:
         print(f"[TELEGRAM ERROR] {e}")
-        return False
+        return None
 
 
-def _enviar_mensaje(texto):
-    """Envía un mensaje de texto a Telegram."""
+def _enviar_mensaje(chat_id, texto):
+    """Envia un mensaje de texto."""
     try:
         requests.post(
             f"{TG_API}/sendMessage",
-            data={
-                "chat_id": TG_CHAT_ID,
-                "text": texto,
-                "parse_mode": "Markdown"
-            },
+            data={"chat_id": chat_id, "text": texto, "parse_mode": "Markdown"},
             timeout=15
         )
         return True
@@ -54,269 +72,233 @@ def _enviar_mensaje(texto):
         return False
 
 
-def _enviar_documento(filepath, caption=""):
-    """Envía un archivo como documento a Telegram."""
+def _responder_callback(callback_id, texto):
+    """Responde a un callback query (quita el relojito del boton)."""
     try:
-        with open(filepath, 'rb') as doc:
-            requests.post(
-                f"{TG_API}/sendDocument",
-                data={
-                    "chat_id": TG_CHAT_ID,
-                    "caption": caption
-                },
-                files={"document": doc},
-                timeout=30
-            )
-        return True
+        requests.post(
+            f"{TG_API}/answerCallbackQuery",
+            data={"callback_query_id": callback_id, "text": texto},
+            timeout=10
+        )
     except Exception as e:
-        print(f"[TELEGRAM ERROR] {e}")
-        return False
+        print(f"[TELEGRAM ERROR callback] {e}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# NUEVO: FLUJO DE VALIDACIÓN MANUAL (AMANDA)
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# VALIDACION: Enviar al validador con botones
+# ==============================================================================
 
-def enviar_a_validador(frame_path, numero, confianza, ts):
-    """Envía la detección a Amanda con botones de validación."""
+def enviar_a_validador(frame_path, numero, confianza, ts, estado):
+    """
+    Envia la deteccion al validador con botones inline.
+    El validador decide si es correcta o no.
+    """
     caption = (
-        f"🔍 *Validación Requerida*\n"
-        f"🚌 Unidad detectada: `{numero}`\n"
-        f"📊 Confianza: `{round(confianza * 100)}%`\n"
-        f"🕐 Hora: `{ts}`\n\n"
-        f"¿Es correcta la lectura?"
+        f"\U0001f50d *Validar deteccion*\n"
+        f"\U0001f522 Numero: `{numero}`\n"
+        f"\U0001f4ca Confianza: `{round(confianza * 100)}%`\n"
+        f"\U0001f4cb Estado: `{estado}`\n"
+        f"\U0001f550 Hora: `{ts}`\n\n"
+        f"_Presiona un boton para validar_"
     )
 
-    # Definimos los botones inline
-    keyboard = {
+    keyboard = json.dumps({
         "inline_keyboard": [[
-            {"text": "✅ Correcto", "callback_data": f"val_ok_{numero}"},
-            {"text": "❌ Incorrecto", "callback_data": f"val_err_{numero}"}
+            {"text": "\u2713 Correcto", "callback_data": f"ok:{numero}"},
+            {"text": "\u2717 Incorrecto", "callback_data": f"no:{numero}"}
         ]]
-    }
+    })
 
-    try:
-        with open(frame_path, 'rb') as foto:
-            requests.post(
-                f"{TG_API}/sendPhoto",
-                data={
-                    "chat_id": TG_VALIDADOR_ID,
-                    "caption": caption,
-                    "parse_mode": "Markdown",
-                    "reply_markup": json.dumps(keyboard)
-                },
-                files={"photo": foto},
-                timeout=15
-            )
-        print(f"[TELEGRAM] Detección {numero} enviada a validador.")
-        return True
-    except Exception as e:
-        print(f"[TELEGRAM ERROR Validador] {e}")
-        return False
+    msg_id = _enviar_foto(TG_VALIDADOR_ID, frame_path, caption, reply_markup=keyboard)
 
-def procesar_callback_validador(callback_data, message_id, file_id, chat_validador_id):
-    """
-    Se ejecuta cuando Amanda presiona un botón. 
-    Recibe el file_id de la foto para reenviarla sin volver a cargarla.
-    """
-    numero = callback_data.split("_")[2]
-
-    if callback_data.startswith("val_ok_"):
-        print(f"[VALIDACIÓN] Unidad {numero} CONFIRMADA por validador.")
-        
-        # 1. Enviar al grupo de MONITOR JETSON
-        _enviar_alerta_confirmada_grupo(numero, file_id)
-
-        # 2. Enviar a Swagger (COMENTADO POR EL MOMENTO)
-        # try:
-        #     swagger_url = "http://tu-endpoint-swagger/api/alertas"
-        #     data_swagger = {"unidad": numero, "estado": "validado_manualmente"}
-        #     requests.post(swagger_url, json=data_swagger, timeout=5)
-        #     print(f"[SWAGGER] Unidad {numero} enviada con éxito.")
-        # except Exception as e:
-        #     print(f"[SWAGGER ERROR] {e}")
-
-        # 3. Editar el mensaje de Amanda para quitar botones y confirmar
-        _editar_mensaje_validador(chat_validador_id, message_id, f"✅ *Unidad {numero} confirmada y procesada.*")
-
-    elif callback_data.startswith("val_err_"):
-        print(f"[VALIDACIÓN] Unidad {numero} RECHAZADA por validador.")
-        # Editar el mensaje de Amanda para indicar que se descartó
-        _editar_mensaje_validador(chat_validador_id, message_id, f"❌ *Unidad {numero} marcada como error y descartada.*")
-
-def _enviar_alerta_confirmada_grupo(numero, file_id):
-    """Envía la alerta al grupo general usando el file_id de Telegram para mayor velocidad."""
-    caption = (
-        f"🚌 *Unidad Detectada (Validada ✅)*\n"
-        f"🔢 Número: `{numero}`\n"
-        f"👤 Revisado por operador."
-    )
-    try:
-        requests.post(
-            f"{TG_API}/sendPhoto",
-            data={
-                "chat_id": TG_CHAT_ID,
-                "caption": caption,
-                "parse_mode": "Markdown",
-                "photo": file_id
-            },
-            timeout=15
-        )
-    except Exception as e:
-        print(f"[TELEGRAM ERROR Grupo] {e}")
-
-def _editar_mensaje_validador(chat_id, message_id, nuevo_texto):
-    """Edita el mensaje del validador para quitar los botones y actualizar el estado."""
-    try:
-        requests.post(
-            f"{TG_API}/editMessageCaption",
-            data={
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "caption": nuevo_texto,
-                "parse_mode": "Markdown"
-                # Al no enviar 'reply_markup', los botones desaparecen automáticamente
+    if msg_id:
+        with _pendientes_lock:
+            _pendientes[msg_id] = {
+                "numero": numero,
+                "confianza": confianza,
+                "ts": ts,
+                "estado": estado,
+                "frame_path": frame_path,
             }
-        )
-    except Exception as e:
-        print(f"[TELEGRAM ERROR Edición] {e}")
+        print(f"[VALIDADOR] Enviado {numero} para validacion (msg_id={msg_id})")
+    else:
+        # Fallback: enviar directo al grupo
+        print(f"[VALIDADOR] Fallo envio, fallback a grupo directo")
+        alerta_unidad_detectada(frame_path, numero, confianza, ts)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ALERTAS DE DETECCIÓN (usadas por pipe_stream.py originales)
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# CALLBACK LISTENER: Escucha respuestas del validador
+# ==============================================================================
+
+def _procesar_callbacks():
+    """Hilo que escucha las respuestas del validador via long polling."""
+    global _update_offset
+
+    while True:
+        try:
+            resp = requests.get(
+                f"{TG_API}/getUpdates",
+                params={
+                    "offset": _update_offset,
+                    "timeout": 30,
+                    "allowed_updates": '["callback_query"]'
+                },
+                timeout=35
+            )
+            updates = resp.json().get("result", [])
+
+            for update in updates:
+                _update_offset = update["update_id"] + 1
+
+                cb = update.get("callback_query")
+                if not cb:
+                    continue
+
+                cb_id = cb["id"]
+                cb_data = cb.get("data", "")
+                msg_id = cb.get("message", {}).get("message_id")
+                user_id = str(cb.get("from", {}).get("id", ""))
+
+                # Solo aceptar del validador autorizado
+                if user_id != TG_VALIDADOR_ID:
+                    _responder_callback(cb_id, "No autorizado")
+                    continue
+
+                with _pendientes_lock:
+                    datos = _pendientes.pop(msg_id, None)
+
+                if not datos:
+                    _responder_callback(cb_id, "Ya procesada")
+                    continue
+
+                if cb_data.startswith("ok:"):
+                    _responder_callback(cb_id, f"\u2713 {datos['numero']} verificado")
+                    _on_correcto(datos)
+
+                elif cb_data.startswith("no:"):
+                    _responder_callback(cb_id, f"\u2717 {datos['numero']} descartado")
+                    _on_incorrecto(datos)
+
+        except requests.exceptions.Timeout:
+            continue
+        except Exception as e:
+            print(f"[CALLBACK ERROR] {e}")
+            time.sleep(5)
+
+
+def _on_correcto(datos):
+    """Validador confirmo: enviar al grupo + swagger."""
+    numero = datos["numero"]
+    confianza = datos["confianza"]
+    ts = datos["ts"]
+    frame_path = datos["frame_path"]
+
+    caption = (
+        f"\u2705 *Unidad VERIFICADA*\n"
+        f"\U0001f522 Numero: `{numero}`\n"
+        f"\U0001f4ca Confianza: `{round(confianza * 100)}%`\n"
+        f"\U0001f550 Hora: `{ts}`\n"
+        f"\U0001f464 _Validado manualmente_"
+    )
+    _enviar_foto(TG_CHAT_ID, frame_path, caption)
+    print(f"[VERIFICADO] {numero} enviado al grupo")
+
+    # Swagger/JSON (descomentar cuando tengas endpoint)
+    # enviar_a_swagger(datos)
+    print(f"[SWAGGER] {numero} listo para enviar (endpoint pendiente)")
+
+
+def _on_incorrecto(datos):
+    """Validador rechazo: mover a /revisar."""
+    numero = datos["numero"]
+    frame_path = datos["frame_path"]
+
+    if os.path.exists(frame_path):
+        dest = os.path.join(REVISAR_DIR, os.path.basename(frame_path))
+        shutil.copy2(frame_path, dest)
+        print(f"[RECHAZADO] {numero} movido a revisar/")
+    else:
+        print(f"[RECHAZADO] {numero} frame no encontrado")
+
+    _enviar_mensaje(TG_VALIDADOR_ID,
+        f"\U0001f5d1 `{numero}` descartado y guardado en `revisar/`")
+
+
+# ==============================================================================
+# SWAGGER / JSON API (placeholder)
+# ==============================================================================
+
+def enviar_a_swagger(datos):
+    """Descomentar y configurar cuando tengas el endpoint."""
+    # payload = {
+    #     "no_economico": datos["numero"],
+    #     "confianza": datos["confianza"],
+    #     "hora_paso": datos["ts"],
+    #     "id_puerta": 1,
+    # }
+    # try:
+    #     resp = requests.post("https://tu-api.com/api/eventoPaso",
+    #         json=payload, headers={"Authorization": "Bearer TOKEN"}, timeout=15)
+    #     print(f"[SWAGGER] {datos['numero']} -> {resp.status_code}")
+    # except Exception as e:
+    #     print(f"[SWAGGER ERROR] {e}")
+    pass
+
+
+# ==============================================================================
+# ALERTAS DIRECTAS (sin validacion)
+# ==============================================================================
 
 def alerta_unidad_detectada(frame_path, numero, confianza, ts):
-    """Unidad válida detectada y verificada contra la BD."""
+    """Fallback: envia directo al grupo sin validacion."""
     caption = (
-        f"🚌 *Unidad detectada*\n"
-        f"🔢 Número: `{numero}`\n"
-        f"📊 Confianza: `{round(confianza * 100)}%`\n"
-        f"🕐 Hora: `{ts}`"
+        f"\U0001f68c *Unidad detectada*\n"
+        f"\U0001f522 Numero: `{numero}`\n"
+        f"\U0001f4ca Confianza: `{round(confianza * 100)}%`\n"
+        f"\U0001f550 Hora: `{ts}`"
     )
-    if _enviar_foto(frame_path, caption):
-        print(f"[TELEGRAM] Enviado: {numero} (OK)")
-
-
-def alerta_unidad_sospechosa(frame_path, numero, confianza, ts):
-    """Unidad detectada pero no está en la lista de registradas."""
-    caption = (
-        f"⚠️ *UNIDAD SOSPECHOSA*\n"
-        f"🔢 OCR leyó: `{numero}`\n"
-        f"❓ No está en lista de unidades\n"
-        f"📊 Confianza: `{round(confianza * 100)}%`\n"
-        f"🕐 Hora: `{ts}`\n"
-        f"_Revisar frame para mejorar detección_"
-    )
-    if _enviar_foto(frame_path, caption):
-        print(f"[TELEGRAM] Enviado: {numero} (SOSPECHOSO)")
+    _enviar_foto(TG_CHAT_ID, frame_path, caption)
+    print(f"[TELEGRAM] Enviado: {numero}")
 
 
 def alerta_unidad_desconocida(frame_path, numero, confianza, ts):
-    """Número OCR que no coincide con ninguna unidad en la BD."""
+    """Numero OCR desconocido — va directo al grupo."""
     caption = (
-        f"🚫 *NÚMERO DESCONOCIDO*\n"
-        f"🔢 OCR leyó: `{numero}`\n"
-        f"❌ No existe en la base de datos\n"
-        f"📊 Confianza YOLO: `{round(confianza * 100)}%`\n"
-        f"🕐 Hora: `{ts}`\n"
-        f"📁 Guardado en: `unidades_desconocidas/`\n"
-        f"_⚠️ Revisar frame — número desconocido_"
+        f"\U0001f6ab *NUMERO DESCONOCIDO*\n"
+        f"\U0001f522 OCR leyo: `{numero}`\n"
+        f"\u274c No existe en la base de datos\n"
+        f"\U0001f4ca Confianza YOLO: `{round(confianza * 100)}%`\n"
+        f"\U0001f550 Hora: `{ts}`\n"
+        f"\U0001f4c1 Guardado en: `unidades_desconocidas/`\n"
+        f"_\u26a0\ufe0f Revisar frame_"
     )
-    if _enviar_foto(frame_path, caption):
-        print(f"[TELEGRAM] Alerta desconocida enviada: {numero}")
+    _enviar_foto(TG_CHAT_ID, frame_path, caption)
+    print(f"[TELEGRAM] Desconocida: {numero}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ALERTAS DE SISTEMA (usadas por el script de diagnóstico o monitoreo futuro)
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# ALERTAS DE SISTEMA
+# ==============================================================================
 
 def alerta_servicio_caido(servicio, detalles=""):
-    """El servicio de monitoreo se detuvo."""
-    texto = (
-        f"🔴 *SERVICIO CAÍDO*\n"
-        f"⚙️ Servicio: `{servicio}`\n"
-        f"🕐 Detectado: ahora\n"
-    )
+    texto = f"\U0001f534 *SERVICIO CAIDO*\n\u2699\ufe0f `{servicio}`\n"
     if detalles:
-        texto += f"📋 Detalles: {detalles}\n"
-    texto += "\n_Verificar estado del equipo_"
-    _enviar_mensaje(texto)
-    print(f"[TELEGRAM] Alerta servicio caído: {servicio}")
-
-
-def alerta_camara_caida(ip, nombre="Cámara"):
-    """Una cámara no responde al ping."""
-    texto = (
-        f"📷 *{nombre.upper()} SIN RESPUESTA*\n"
-        f"🌐 IP: `{ip}`\n"
-        f"🕐 Detectado: ahora\n"
-        f"_Verificar conexión física y alimentación_"
-    )
-    _enviar_mensaje(texto)
-    print(f"[TELEGRAM] Alerta cámara caída: {ip}")
-
-
-def alerta_switch_caido(ip, nombre="Switch"):
-    """Un switch no responde al ping."""
-    texto = (
-        f"🔴 *{nombre.upper()} SIN RESPUESTA*\n"
-        f"🌐 IP: `{ip}`\n"
-        f"🕐 Detectado: ahora\n"
-        f"_Verificar alimentación y conexión del switch_"
-    )
-    _enviar_mensaje(texto)
-    print(f"[TELEGRAM] Alerta switch caído: {ip}")
-
+        texto += f"{detalles}\n"
+    _enviar_mensaje(TG_CHAT_ID, texto)
 
 def alerta_pipeline_error():
-    """El pipeline de video GStreamer falló."""
-    texto = (
-        f"🔴 *PIPELINE DE VIDEO CAÍDO*\n"
-        f"📹 No se puede conectar a la cámara RTSP\n"
-        f"🕐 Detectado: ahora\n"
-        f"_Reintentando conexión automáticamente..._"
-    )
-    _enviar_mensaje(texto)
-    print("[TELEGRAM] Alerta pipeline caído")
-
+    _enviar_mensaje(TG_CHAT_ID,
+        "\U0001f534 *PIPELINE CAIDO*\n_Reintentando conexion..._")
 
 def alerta_postgres_desconectada():
-    """PostgreSQL no responde."""
-    texto = (
-        f"🔴 *POSTGRESQL DESCONECTADA*\n"
-        f"🗄️ No se pudo conectar a la base de datos\n"
-        f"⚠️ Todas las detecciones serán DESCARTADAS\n"
-        f"🕐 Detectado: ahora\n"
-        f"_Verificar: sudo systemctl status postgresql_"
-    )
-    _enviar_mensaje(texto)
-    print("[TELEGRAM] Alerta PostgreSQL desconectada")
+    _enviar_mensaje(TG_CHAT_ID,
+        "\U0001f534 *POSTGRESQL DESCONECTADA*\n_Detecciones descartadas_")
 
 
-def alerta_temperatura_alta(temp_c, zona=""):
-    """Temperatura del equipo por encima del umbral."""
-    texto = (
-        f"🌡️ *TEMPERATURA ALTA*\n"
-        f"🔥 {temp_c}°C"
-    )
-    if zona:
-        texto += f" en `{zona}`"
-    texto += (
-        f"\n🕐 Detectado: ahora\n"
-        f"_Verificar ventilación del equipo_"
-    )
-    _enviar_mensaje(texto)
-    print(f"[TELEGRAM] Alerta temperatura: {temp_c}°C")
-
-
-def enviar_reporte_diagnostico(filepath, resumen_alertas, sha256_hash):
-    """Envía el reporte de diagnóstico completo con resumen."""
-    texto = (
-        f"🚨 *ALERTA CISA — DIAGNÓSTICO*\n\n"
-        f"{resumen_alertas}\n"
-        f"🔐 SHA256: `{sha256_hash[:16]}...`"
-    )
-    _enviar_mensaje(texto)
-    _enviar_documento(filepath, "📎 Reporte diagnóstico CISA")
-    print("[TELEGRAM] Reporte de diagnóstico enviado")
+# ==============================================================================
+# INICIAR LISTENER
+# ==============================================================================
+_callback_thread = threading.Thread(target=_procesar_callbacks, daemon=True)
+_callback_thread.start()
+print("[VALIDADOR] Listener de callbacks iniciado")

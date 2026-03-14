@@ -25,14 +25,12 @@ from config import (
     PG_CONFIG, MODEL_PATH, MODEL_CONF, COOLDOWN_SEG, N_VOTOS, VOTO_WINDOW,
     OCR_TARGET_H, OCR_MIN_SIZE, OCR_MAX_DIGITS, OCR_MIN_DIGITS,
     LEVENSHTEIN_MAX, ID_PUERTA, HLS_TIMEOUT, HLS_RESOLUTION, HLS_FPS,
-    FLASK_HOST, FLASK_PORT, PG_REFRESH_INTERVAL,
-    TG_TOKEN, TG_VALIDADOR_ID  # <-- Credenciales para el listener de Telegram
+    FLASK_HOST, FLASK_PORT, PG_REFRESH_INTERVAL
 )
 from alertas import (
     alerta_unidad_detectada,
     alerta_unidad_desconocida,
-    enviar_a_validador,          # <-- Función para enviar validación a Amanda
-    procesar_callback_validador  # <-- Función para manejar el botón pulsado
+    enviar_a_validador,
 )
 
 app = Flask(__name__)
@@ -408,7 +406,40 @@ def validar_numero(leido):
         return None, None
 
     # =============================================
-    # CASO 4: 3 digitos sin 5 u otros formatos → intentar como esta
+    # CASO 4: 3 digitos sin 5 → anteponer '5' (OCR perdio el 5 completo)
+    # Ejemplos: 5425→425, 5063→063, 5029→023
+    # =============================================
+    if len(leido) == 3 and leido[0] != '5':
+        candidato = '5' + leido  # 425 → 5425, 063 → 5063
+        if candidato in unidades_4d5:
+            print(f"[CORREGIDO] OCR '{leido}' -> '{candidato}' (anteponer 5, existe en PG)")
+            return candidato, "CORREGIDO"
+        # Levenshtein
+        mejor, mejor_dist = None, 999
+        for u in unidades_4d5:
+            d = levenshtein(candidato, u)
+            if d < mejor_dist:
+                mejor_dist = d; mejor = u
+        if mejor_dist <= LEVENSHTEIN_MAX:
+            print(f"[CORREGIDO] OCR '{leido}' -> '{candidato}' -> '{mejor}' (Lev={mejor_dist})")
+            return mejor, "CORREGIDO"
+
+        # Tambien intentar '50' + ultimos 2 digitos
+        candidato_50 = '50' + leido[1:]  # 425 → 5025, 063 → 5063
+        if candidato_50 in unidades_4d5:
+            print(f"[CORREGIDO] OCR '{leido}' -> '{candidato_50}' (forzar 50xx)")
+            return candidato_50, "CORREGIDO"
+
+        # Si existe tal cual en PG como 3-dig real
+        if leido in unidades_snapshot:
+            print(f"[VERIFICADO] '{leido}' existe como 3-dig en PG")
+            return leido, "VERIFICADO"
+
+        print(f"[DESCARTADO] '{leido}' -> '{candidato}' sin match")
+        return None, None
+
+    # =============================================
+    # CASO 5: otros formatos
     # =============================================
     if leido in unidades_snapshot:
         print(f"[VERIFICADO] '{leido}' existe en PG")
@@ -416,6 +447,8 @@ def validar_numero(leido):
 
     print(f"[DESCARTADO] '{leido}' formato no reconocido")
     return None, None
+
+
 
 
 def recuperar_ocr(leido):
@@ -879,11 +912,9 @@ class InferenceStream:
                 print(f"[NEW {estado}] {numero_valido} | Conf: {conf:.2f} | TRACKING iniciado")
 
                 ts_now = self._track_ts
-                
-                # NUEVO: Enviamos el frame a Amanda para validación manual en Telegram
                 threading.Thread(
                     target=enviar_a_validador,
-                    args=(frame_path, numero_valido, conf, ts_now),
+                    args=(frame_path, numero_valido, conf, ts_now, estado),
                     daemon=True
                 ).start()
 
@@ -996,42 +1027,6 @@ class InferenceStream:
 
 
 # ==============================================================================
-# Hilo 3: Escucha de Telegram (Callbacks de Amanda)
-# ==============================================================================
-def _telegram_listener():
-    """Hilo en background para escuchar los botones de Telegram sin bloquear el sistema."""
-    import requests
-    print("[INFO] Iniciando listener de Telegram (Validación manual)...")
-    last_update_id = 0
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"
-    
-    while True:
-        try:
-            # Timeout de 10s para "long polling" (no consume CPU si no hay mensajes)
-            res = requests.get(f"{url}?offset={last_update_id + 1}&timeout=10", timeout=15).json()
-            
-            for update in res.get("result", []):
-                last_update_id = update["update_id"]
-                
-                if "callback_query" in update:
-                    cb = update["callback_query"]
-                    data = cb["data"]
-                    msg_id = cb["message"]["message_id"]
-                    chat_id = cb["message"]["chat"]["id"]
-                    
-                    # Extraer el file_id de la foto original para no tener que resubirla al reenviar
-                    file_id = None
-                    if "photo" in cb["message"]:
-                        file_id = cb["message"]["photo"][-1]["file_id"]
-                        
-                    if chat_id == TG_VALIDADOR_ID:
-                        procesar_callback_validador(data, msg_id, file_id, chat_id)
-                        
-        except Exception as e:
-            time.sleep(2)
-
-
-# ==============================================================================
 # Iniciar hilos
 # ==============================================================================
 stream    = VideoStream()
@@ -1139,10 +1134,6 @@ if __name__ == '__main__':
     print(f"[INFO] PostgreSQL: {'CONECTADA' if _pg_connected else 'DESCONECTADA'} — {len(UNIDADES)} unidades")
     print(f"[INFO] Modo: VALIDACION ESTRICTA — solo acepta unidades en PG")
     print(f"[INFO] Tracker: IoU + numero (costo: ~0 CPU)")
-    
-    # Arrancamos el hilo de escucha de Telegram para Amanda
-    threading.Thread(target=_telegram_listener, daemon=True).start()
-    
     try:
         app.run(host=FLASK_HOST, port=FLASK_PORT, threaded=True, use_reloader=False)
     except KeyboardInterrupt:

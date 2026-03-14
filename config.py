@@ -9,8 +9,9 @@ import os
 # ==============================================================================
 # TELEGRAM
 # ==============================================================================
-TG_TOKEN   = "8450858285:AAFNh2MIYuZsCR7LNvE-KlYPTlUEEaX7YPo"
-TG_CHAT_ID = "-5249532175"
+TG_TOKEN        = "8450858285:AAFNh2MIYuZsCR7LNvE-KlYPTlUEEaX7YPo"
+TG_CHAT_ID      = "-5249532175"
+TG_VALIDADOR_ID = "6854120172"    # Chat ID del validador humano
 
 # ==============================================================================
 # CAMARA / RTSP
@@ -35,11 +36,12 @@ CROPS_DIR        = os.path.join(FRAMES_DIR, "crops")
 CLEAN_DIR        = os.path.join(FRAMES_DIR, "clean")
 CLEAN_LATERAL_DIR  = os.path.join(CLEAN_DIR, "numeroslaterales")
 CLEAN_TRASERO_DIR  = os.path.join(CLEAN_DIR, "numerostraseros")
+REVISAR_DIR        = os.path.join(FRAMES_DIR, "revisar")
 DB_PATH          = "/home/cisa/Documents/ProyectoIA/detecciones.db"
 
 # Crear directorios automaticamente
 for d in [HLS_DIR, FRAMES_DIR, DESCONOCIDAS_DIR, CROPS_DIR,
-          CLEAN_DIR, CLEAN_LATERAL_DIR, CLEAN_TRASERO_DIR]:
+          CLEAN_DIR, CLEAN_LATERAL_DIR, CLEAN_TRASERO_DIR, REVISAR_DIR]:
     os.makedirs(d, exist_ok=True)
 
 # ==============================================================================
