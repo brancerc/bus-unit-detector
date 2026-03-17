@@ -1,6 +1,12 @@
 """
-CISA - Sistema de Detección y Monitoreo de Unidades de Transporte
-Pipeline: RTSP → GStreamer → YOLO → OCR → Validación PG → Tracking → Alertas
+CISA - Sistema de Deteccion y Monitoreo de Unidades de Transporte
+Pipeline: RTSP -> GStreamer -> YOLO -> OCR -> Validacion PG -> Tracking -> Alertas
+
+Cambios:
+  refactor: modelo 1 clase 'numero' — eliminados filtros lateral/trasero/delantero
+  perf: bbox minimo 40px → 60px
+  feat: multi-lectura durante tracking — acumula votos, actualiza pendiente al salir
+  feat: SQLite solo guarda detecciones aprobadas por validador (db_insert en alertas._on_correcto)
 """
 
 import cv2
@@ -31,11 +37,10 @@ from alertas import (
     alerta_unidad_detectada,
     alerta_unidad_desconocida,
     enviar_a_validador,
+    actualizar_pendiente,
 )
 
 app = Flask(__name__)
-
-# Cargar templates HTML
 TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
 
 with open(os.path.join(TEMPLATE_DIR, "home.html"), encoding="utf-8") as f:
@@ -51,20 +56,8 @@ print(f"[INFO] Templates cargados desde {TEMPLATE_DIR}")
 # ==============================================================================
 
 class SimpleTracker:
-    """
-    Rastrea la unidad activa en camara usando solapamiento de cajas (IoU).
-    Costo computacional: ~0 (4 operaciones aritmeticas por frame).
-    No necesita Kalman, no necesita SORT, no necesita scipy.
-
-    Flujo:
-      1. YOLO detecta -> OCR lee -> PG valida -> tracker.update(bbox, numero)
-      2. Si es el MISMO bus (IoU alto o mismo numero) -> retorna TRACKING -> no hace nada
-      3. Si es un bus NUEVO -> cierra el track anterior -> retorna NEW -> alerta + guarda
-      4. Cada frame sin deteccion -> tracker.check_gone() verifica si el bus se fue
-    """
-
     IOU_THRESHOLD = 0.20
-    GONE_TIMEOUT  = 30.0   # Esperar hasta que realmente salga de camara
+    GONE_TIMEOUT  = 30.0
 
     def __init__(self):
         self.active = None
@@ -81,32 +74,21 @@ class SimpleTracker:
 
     def update(self, bbox, numero, estado, conf):
         now = time.time()
-
         if self.active:
             overlap  = self.iou(bbox, self.active['bbox'])
             same_num = (numero == self.active['numero'])
-
             if overlap > self.IOU_THRESHOLD or same_num:
                 self.active['bbox']      = bbox
                 self.active['last_seen'] = now
                 if conf > self.active['conf']:
                     self.active['conf'] = conf
                 return 'TRACKING'
-
-            # Bus activo pero numero diferente y IoU bajo:
-            # NO crear nuevo track, es el mismo bus con OCR erroneo.
-            # Solo aceptar nuevo bus si el actual ya expiro (check_gone lo limpia)
             print(f"[TRACKER] Ignorando '{numero}' — bus activo: {self.active['numero']}")
-            self.active['last_seen'] = now  # Mantener vivo el track actual
+            self.active['last_seen'] = now
             return 'TRACKING'
-
         self.active = {
-            'numero':     numero,
-            'estado':     estado,
-            'conf':       conf,
-            'bbox':       bbox,
-            'first_seen': now,
-            'last_seen':  now,
+            'numero': numero, 'estado': estado, 'conf': conf,
+            'bbox': bbox, 'first_seen': now, 'last_seen': now,
         }
         return 'NEW'
 
@@ -146,19 +128,14 @@ def cargar_unidades_pg():
         cur = con.cursor()
         cur.execute("SELECT no_economico FROM unidad WHERE estado = true")
         nuevas = set(str(row[0]).strip() for row in cur.fetchall())
-        cur.close()
-        con.close()
-
+        cur.close(); con.close()
         with _unidades_lock:
             if nuevas != UNIDADES:
                 agregadas  = nuevas - UNIDADES
                 eliminadas = UNIDADES - nuevas
-                if agregadas:
-                    print(f"[PG] Unidades nuevas detectadas: {sorted(agregadas)}")
-                if eliminadas:
-                    print(f"[PG] Unidades removidas: {sorted(eliminadas)}")
+                if agregadas:  print(f"[PG] Unidades nuevas: {sorted(agregadas)}")
+                if eliminadas: print(f"[PG] Unidades removidas: {sorted(eliminadas)}")
                 UNIDADES = nuevas
-
         _pg_connected = True
         print(f"[PG] Conectado — {len(nuevas)} unidades activas")
         return True
@@ -186,15 +163,11 @@ threading.Thread(target=_refresh_unidades_loop, daemon=True).start()
 
 
 # ==============================================================================
-# SQLite
+# SQLite — solo esquema e inicializacion
+# El db_insert vive en alertas._on_correcto y se llama solo al aprobar
 # ==============================================================================
 
 def init_db():
-    """
-    Esquema SQLite espejo de eventoPaso (PostgreSQL).
-    Misma estructura para facilitar migracion de datos confirmados.
-    Campos extra (estado, confianza) se ignoran al migrar.
-    """
     con = sqlite3.connect(DB_PATH)
     con.execute("""
         CREATE TABLE IF NOT EXISTS evento_paso (
@@ -211,7 +184,6 @@ def init_db():
             duracion_camara REAL    DEFAULT 0
         )
     """)
-    # Migrar tabla vieja si existe
     try:
         cur = con.execute("SELECT COUNT(*) FROM detecciones")
         old_count = cur.fetchone()[0]
@@ -225,45 +197,9 @@ def init_db():
             con.commit()
             print(f"[DB] Migrados {old_count} registros de 'detecciones' a 'evento_paso'.")
     except sqlite3.OperationalError:
-        pass  # tabla detecciones no existe, todo bien
+        pass
     con.commit(); con.close()
     print("[DB] SQLite lista (esquema evento_paso).")
-
-
-def db_insert(no_detectado, no_economico, confianza, captura_url=None,
-              estado="VERIFICADO", duracion=0):
-    """
-    Inserta un evento en evento_paso (espejo de PostgreSQL).
-    no_detectado: lo que OCR leyo (crudo)
-    no_economico: numero validado/corregido contra PG (None si desconocida)
-    """
-    now = datetime.now()
-    try:
-        con = sqlite3.connect(DB_PATH)
-        con.execute(
-            """INSERT INTO evento_paso
-               (no_detectado, no_economico, direccion, hora_paso, id_puerta,
-                hora_registro, captura_url, estado, confianza, duracion_camara)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (no_detectado, no_economico, "entrada",
-             now.strftime("%Y-%m-%d %H:%M:%S"), ID_PUERTA,
-             now.strftime("%Y-%m-%d %H:%M:%S"), captura_url,
-             estado, round(confianza, 3), round(duracion, 1)))
-        con.commit(); con.close()
-    except Exception as e:
-        print(f"[DB ERROR] {e}")
-
-
-def db_update_duracion(no_economico, hora_paso, duracion):
-    """Actualiza duracion_camara del ultimo evento de este numero."""
-    try:
-        con = sqlite3.connect(DB_PATH)
-        con.execute(
-            "UPDATE evento_paso SET duracion_camara=? WHERE no_economico=? AND hora_paso=?",
-            (round(duracion, 1), no_economico, hora_paso))
-        con.commit(); con.close()
-    except Exception as e:
-        print(f"[DB ERROR] update duracion: {e}")
 
 
 def db_query(fecha=None, limit=50):
@@ -317,130 +253,84 @@ def levenshtein(a, b):
 
 
 def validar_numero(leido):
-    """
-    Valida contra PG con prioridad: 4 digitos > 3 digitos.
-    Patron OCR: Tesseract pierde el '0' (segundo digito): 5038→538, 5009→509
-    Estrategia:
-      1. Si 4 digitos con 5: buscar directo
-      2. Si 3 digitos con 5: insertar '0' pos 1 → buscar 50xx primero
-      3. Si 4-dig no matchea: fallback a 3-dig real en PG
-      4. Si 4 digitos sin 5: forzar primer digito '5'
-    """
     leido = leido.strip()
-
     with _unidades_lock:
         unidades_snapshot = UNIDADES.copy()
-
     if not unidades_snapshot:
         print(f"[DESCARTADO] '{leido}' — lista PG vacia")
         return None, None
 
     unidades_4d5 = {u for u in unidades_snapshot if len(u) == 4 and u.startswith('5')}
 
-    # =============================================
-    # CASO 1: Ya es 4 digitos empezando con 5 → match directo
-    # =============================================
     if len(leido) == 4 and leido.startswith('5'):
         if leido in unidades_4d5:
             print(f"[VERIFICADO] '{leido}' existe en PostgreSQL")
             return leido, "VERIFICADO"
-        # Levenshtein
         mejor, mejor_dist = None, 999
         for u in unidades_4d5:
             d = levenshtein(leido, u)
-            if d < mejor_dist:
-                mejor_dist = d; mejor = u
+            if d < mejor_dist: mejor_dist = d; mejor = u
         if mejor_dist <= LEVENSHTEIN_MAX:
             print(f"[CORREGIDO] '{leido}' -> '{mejor}' (Lev={mejor_dist})")
             return mejor, "CORREGIDO"
         print(f"[DESCARTADO] '{leido}' sin match 4dig (mejor: {mejor}, dist={mejor_dist})")
         return None, None
 
-    # =============================================
-    # CASO 2: 3 digitos empezando con 5
-    # PRIMERO: aceptar si existe tal cual en PG (es bus real de 3 dig)
-    # SEGUNDO: si no existe, intentar insertar 0 → 50xx (OCR perdio el 0)
-    # =============================================
     if len(leido) == 3 and leido[0] == '5':
-        # Match directo como 3-digitos real
         if leido in unidades_snapshot:
             print(f"[VERIFICADO] '{leido}' existe como 3-dig en PG")
             return leido, "VERIFICADO"
-
-        # No existe como 3-dig → intentar como 50xx (OCR perdio el 0)
-        candidato_4d = leido[0] + '0' + leido[1:]  # 538 → 5038
+        candidato_4d = leido[0] + '0' + leido[1:]
         if candidato_4d in unidades_4d5:
-            print(f"[CORREGIDO] OCR '{leido}' -> '{candidato_4d}' (insertar 0, existe en PG)")
+            print(f"[CORREGIDO] OCR '{leido}' -> '{candidato_4d}' (insertar 0)")
             return candidato_4d, "CORREGIDO"
-        # Levenshtein sobre 4 digitos
         mejor, mejor_dist = None, 999
         for u in unidades_4d5:
             d = levenshtein(candidato_4d, u)
-            if d < mejor_dist:
-                mejor_dist = d; mejor = u
+            if d < mejor_dist: mejor_dist = d; mejor = u
         if mejor_dist <= LEVENSHTEIN_MAX:
             print(f"[CORREGIDO] OCR '{leido}' -> '{candidato_4d}' -> '{mejor}' (Lev={mejor_dist})")
             return mejor, "CORREGIDO"
-
         print(f"[DESCARTADO] '{leido}' sin match 3dig ni 4dig")
         return None, None
 
-    # =============================================
-    # CASO 3: 4 digitos que NO empiezan con 5 → forzar '5'
-    # =============================================
     if len(leido) == 4 and leido[0] != '5':
         normalizado = '5' + leido[1:]
-        print(f"[NORMALIZADO] '{leido}' -> '{normalizado}' (primer dig -> 5)")
         if normalizado in unidades_4d5:
-            print(f"[CORREGIDO] '{leido}' -> '{normalizado}' (existe en PG)")
+            print(f"[CORREGIDO] '{leido}' -> '{normalizado}'")
             return normalizado, "CORREGIDO"
         mejor, mejor_dist = None, 999
         for u in unidades_4d5:
             d = levenshtein(normalizado, u)
-            if d < mejor_dist:
-                mejor_dist = d; mejor = u
+            if d < mejor_dist: mejor_dist = d; mejor = u
         if mejor_dist <= LEVENSHTEIN_MAX:
             print(f"[CORREGIDO] '{leido}' -> '{normalizado}' -> '{mejor}' (Lev={mejor_dist})")
             return mejor, "CORREGIDO"
         print(f"[DESCARTADO] '{leido}' -> '{normalizado}' sin match")
         return None, None
 
-    # =============================================
-    # CASO 4: 3 digitos sin 5 → anteponer '5' (OCR perdio el 5 completo)
-    # Ejemplos: 5425→425, 5063→063, 5029→023
-    # =============================================
     if len(leido) == 3 and leido[0] != '5':
-        candidato = '5' + leido  # 425 → 5425, 063 → 5063
+        candidato = '5' + leido
         if candidato in unidades_4d5:
-            print(f"[CORREGIDO] OCR '{leido}' -> '{candidato}' (anteponer 5, existe en PG)")
+            print(f"[CORREGIDO] OCR '{leido}' -> '{candidato}' (anteponer 5)")
             return candidato, "CORREGIDO"
-        # Levenshtein
         mejor, mejor_dist = None, 999
         for u in unidades_4d5:
             d = levenshtein(candidato, u)
-            if d < mejor_dist:
-                mejor_dist = d; mejor = u
+            if d < mejor_dist: mejor_dist = d; mejor = u
         if mejor_dist <= LEVENSHTEIN_MAX:
             print(f"[CORREGIDO] OCR '{leido}' -> '{candidato}' -> '{mejor}' (Lev={mejor_dist})")
             return mejor, "CORREGIDO"
-
-        # Tambien intentar '50' + ultimos 2 digitos
-        candidato_50 = '50' + leido[1:]  # 425 → 5025, 063 → 5063
+        candidato_50 = '50' + leido[1:]
         if candidato_50 in unidades_4d5:
             print(f"[CORREGIDO] OCR '{leido}' -> '{candidato_50}' (forzar 50xx)")
             return candidato_50, "CORREGIDO"
-
-        # Si existe tal cual en PG como 3-dig real
         if leido in unidades_snapshot:
             print(f"[VERIFICADO] '{leido}' existe como 3-dig en PG")
             return leido, "VERIFICADO"
-
         print(f"[DESCARTADO] '{leido}' -> '{candidato}' sin match")
         return None, None
 
-    # =============================================
-    # CASO 5: otros formatos
-    # =============================================
     if leido in unidades_snapshot:
         print(f"[VERIFICADO] '{leido}' existe en PG")
         return leido, "VERIFICADO"
@@ -449,26 +339,13 @@ def validar_numero(leido):
     return None, None
 
 
-
-
 def recuperar_ocr(leido):
-    """
-    Fallback despues de validar_numero.
-    Estrategia: forzar segundo digito a '0' (50xx).
-    Cubre el caso donde validar_numero normalizo a 5Xxx pero no matcheo.
-    Ejemplo: OCR lee '5538' → validar hizo '5538' → no match → aqui: '5038' → match!
-    """
     leido = leido.strip()
-
     with _unidades_lock:
         unidades_snapshot = UNIDADES.copy()
-
     if not unidades_snapshot:
         return None, None
-
     unidades_4d5 = {u for u in unidades_snapshot if len(u) == 4 and u.startswith('5')}
-
-    # Reconstruir normalizado igual que validar_numero
     normalizado = leido
     if len(leido) == 3 and leido[0] == '5':
         normalizado = leido[0] + '0' + leido[1:]
@@ -476,11 +353,8 @@ def recuperar_ocr(leido):
         normalizado = '50' + leido[1:]
     elif len(leido) == 4 and leido[0] != '5':
         normalizado = '5' + leido[1:]
-
     if len(normalizado) != 4 or not normalizado.startswith('5'):
         return None, None
-
-    # Si segundo digito no es '0', forzar '50xx'
     if normalizado[1] != '0':
         candidato = '50' + normalizado[2:]
         if candidato in unidades_4d5:
@@ -490,18 +364,13 @@ def recuperar_ocr(leido):
             if levenshtein(candidato, u) <= LEVENSHTEIN_MAX:
                 print(f"[RECUPERADO] '{leido}' -> 50{normalizado[2:]} ~ '{u}' (Lev)")
                 return u, "CORREGIDO"
-
     return None, None
 
 
 def _clean_dir_for_class(cls_name):
-    """Retorna el directorio de frames limpios segun la clase YOLO."""
-    cls_lower = cls_name.lower()
-    if 'lateral' in cls_lower:
-        return CLEAN_LATERAL_DIR
-    elif 'trasero' in cls_lower or 'trasera' in cls_lower:
-        return CLEAN_TRASERO_DIR
+    """Con modelo 1 clase 'numero', todos los frames limpios van a CLEAN_DIR."""
     return CLEAN_DIR
+
 
 # ==============================================================================
 # Tesseract OCR
@@ -514,50 +383,32 @@ def leer_numero(crop):
         h, w = crop.shape[:2]
         if h < OCR_MIN_SIZE or w < OCR_MIN_SIZE:
             return None
-
         scale = max(1, OCR_TARGET_H // h)
         crop_up = cv2.resize(crop, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(crop_up, cv2.COLOR_BGR2GRAY)
-
-        # Denoising: eliminar artefactos de compresion H.264
         gray = cv2.fastNlMeansDenoising(gray, h=12, templateWindowSize=7, searchWindowSize=21)
-
-        # Sharpening: restaurar bordes despues del denoising
         blur = cv2.GaussianBlur(gray, (0, 0), 2.0)
         gray = cv2.addWeighted(gray, 1.8, blur, -0.8, 0)
-
-        # Kernel para operaciones morfologicas
         kern = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-
         resultados = []
-
-        # Estrategia 1: CLAHE + Otsu + morfologia
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
         g1 = clahe.apply(gray)
         _, g1 = cv2.threshold(g1, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        g1 = cv2.morphologyEx(g1, cv2.MORPH_CLOSE, kern)  # Cerrar trazos rotos
-        g1 = cv2.morphologyEx(g1, cv2.MORPH_OPEN, kern)   # Eliminar ruido puntual
-
-        # Estrategia 2: Adaptivo + morfologia
+        g1 = cv2.morphologyEx(g1, cv2.MORPH_CLOSE, kern)
+        g1 = cv2.morphologyEx(g1, cv2.MORPH_OPEN, kern)
         g2 = cv2.adaptiveThreshold(gray, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 8)
         g2 = cv2.morphologyEx(g2, cv2.MORPH_CLOSE, kern)
-
-        # Estrategia 3: Invertida de g1
         g3 = cv2.bitwise_not(g1)
-
-        # Estrategia 4: Bilateral + Otsu (preserva bordes mejor que denoising global)
         g4_blur = cv2.bilateralFilter(gray, 9, 75, 75)
         _, g4 = cv2.threshold(g4_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         g4 = cv2.morphologyEx(g4, cv2.MORPH_CLOSE, kern)
-
         config = '--psm 7 -c tessedit_char_whitelist=0123456789'
         for img_proc in [g1, g2, g3, g4]:
             texto = pytesseract.image_to_string(img_proc, config=config).strip()
             limpio = re.sub(r'[^0-9]', '', texto)[:OCR_MAX_DIGITS]
             if len(limpio) >= OCR_MIN_DIGITS:
                 resultados.append(limpio)
-
         if not resultados:
             config8 = '--psm 8 -c tessedit_char_whitelist=0123456789'
             for img_proc in [g1, g4]:
@@ -565,12 +416,9 @@ def leer_numero(crop):
                 limpio = re.sub(r'[^0-9]', '', texto)[:OCR_MAX_DIGITS]
                 if len(limpio) >= OCR_MIN_DIGITS:
                     resultados.append(limpio)
-
         if not resultados:
             return None
-
         return Counter(resultados).most_common(1)[0][0]
-
     except Exception as e:
         print(f"[OCR ERROR] {e}"); return None
 
@@ -590,9 +438,7 @@ STATE = {
     "numero": None, "conf": None, "ts": None,
     "fps": 0.0, "pipeline": False, "total_detecciones": 0,
     "unidades_registradas": 0, "pg_conectada": False,
-    "descartadas": 0,
-    "tracking": None,
-    "tracking_duracion": 0,
+    "descartadas": 0, "tracking": None, "tracking_duracion": 0,
 }
 state_lock = threading.Lock()
 
@@ -614,13 +460,10 @@ def hls_start():
     for f in glob.glob(os.path.join(HLS_DIR, "*")):
         try: os.remove(f)
         except OSError: pass
-
     w, h = HLS_RESOLUTION
     cmd = [
-        'ffmpeg', '-y',
-        '-f', 'rawvideo', '-vcodec', 'rawvideo',
-        '-s', f'{w}x{h}', '-pix_fmt', 'bgr24', '-r', str(HLS_FPS),
-        '-i', '-',
+        'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+        '-s', f'{w}x{h}', '-pix_fmt', 'bgr24', '-r', str(HLS_FPS), '-i', '-',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
         '-f', 'hls', '-hls_time', '2', '-hls_list_size', '10',
         '-hls_flags', 'delete_segments+append_list',
@@ -643,8 +486,7 @@ def hls_stop():
         hls_proc.wait(timeout=3)
     except Exception:
         hls_proc.kill()
-    hls_proc   = None
-    hls_active = False
+    hls_proc = None; hls_active = False
 
 
 def hls_watchdog():
@@ -701,17 +543,14 @@ class VideoStream:
         self._abrir_pipeline()
         while self.running:
             if not self.cap or not self.cap.isOpened():
-                time.sleep(5)
-                self._abrir_pipeline()
-                continue
+                time.sleep(5); self._abrir_pipeline(); continue
             ret, frame = self.cap.read()
             if ret:
                 with state_lock: STATE["pipeline"] = True
                 with self.lock: self.frame = frame
             else:
                 with state_lock: STATE["pipeline"] = False
-                time.sleep(5)
-                self._abrir_pipeline()
+                time.sleep(5); self._abrir_pipeline()
 
     def get_frame(self):
         with self.lock:
@@ -719,8 +558,7 @@ class VideoStream:
 
     def stop(self):
         self.running = False
-        if self.cap:
-            self.cap.release()
+        if self.cap: self.cap.release()
 
 
 # ==============================================================================
@@ -730,9 +568,15 @@ class VideoStream:
 class InferenceStream:
     """
     Arquitectura desacoplada:
-    - Hilo principal: YOLO → plot() con cajas → overlay ligero → HLS (siempre fluido)
-    - Hilo OCR: cola de crops → denoising + OCR pesado → validacion → tracker → alertas
-    El video NUNCA se congela por culpa del OCR.
+    - Hilo principal: YOLO + video (siempre fluido)
+    - Hilo OCR: OCR pesado + validacion + tracker + alertas
+
+    Flujo SQLite:
+    - NEW: guarda frame/crop/clean, envia Telegram al validador, guarda msg_id
+    - TRACKING: acumula lecturas OCR como votos
+    - _cerrar_track: determina ganador, llama actualizar_pendiente(msg_id, ganador, duracion)
+    - _on_correcto (alertas.py): recibe datos finales y hace el db_insert
+    - _on_incorrecto (alertas.py): mueve a /revisar, sin db_insert
     """
     def __init__(self, vs):
         self.lock = threading.Lock()
@@ -742,49 +586,98 @@ class InferenceStream:
         self.fps = 0.0
         self._cnt = 0
         self._t = time.time()
-        # OCR en hilo separado
-        self._ocr_queue = queue.Queue(maxsize=5)
-        self._votos = []
-        self.tracker = SimpleTracker()
+
+        self._ocr_queue    = queue.Queue(maxsize=5)
+        self._votos        = []
+        self.tracker       = SimpleTracker()
         self._tracker_lock = threading.Lock()
-        self._track_ts = None
-        self._track_frame = None
-        self._pending_desc = None
+        self._track_ts     = None
+        self._track_frame  = None
+        self._track_msg_id = None          # msg_id del mensaje Telegram pendiente
+
+        # Multi-lectura
+        self._track_votes          = []    # (numero_valido, conf, estado)
+        self._track_numero_inicial = None
+        self._track_no_detectado   = None
+
+        # Mejor frame para reentrenamiento
+        self._best_train_area  = 0
+        self._best_train_frame = None
+        self._best_train_cls   = None
+
+        # Desconocidas con debounce
+        self._pending_desc       = None
         self._pending_desc_timer = None
-        self._best_train_area = 0      # Area del mejor frame lateral/trasero
-        self._best_train_frame = None  # Frame con numero mas cercano
-        self._best_train_cls = None    # Clase del mejor frame
-        # Arrancar hilo OCR
+
         threading.Thread(target=self._ocr_worker, daemon=True).start()
         print("[INFO] Hilo OCR separado iniciado.")
 
     def _cerrar_track(self, track, duracion):
-        if track and self._track_ts:
-            db_update_duracion(track['numero'], self._track_ts, duracion)
-            print(f"[TRACK FIN] {track['numero']} salio de camara | Duracion: {duracion}s")
+        """
+        Bus salio de camara.
+        Determina numero ganador por votos y notifica a alertas.py via
+        actualizar_pendiente() para que cuando el validador apruebe,
+        SQLite reciba el numero correcto y la duracion real.
+        """
+        if not track or not self._track_ts:
+            return
 
-            # Guardar mejor frame lateral/trasero (1 solo, el mas cercano)
-            if self._best_train_frame is not None and self._best_train_cls:
-                ts_train = datetime.now().strftime("%Y%m%d_%H%M%S")
-                cls_l = self._best_train_cls.lower()
-                train_dest = CLEAN_LATERAL_DIR if 'lateral' in cls_l else CLEAN_TRASERO_DIR
-                train_name = f"{ts_train}_{track['numero']}_{self._best_train_cls}.jpg"
-                cv2.imwrite(os.path.join(train_dest, train_name), self._best_train_frame)
-                print(f"[TRAIN] Guardado frame {self._best_train_cls} de {track['numero']}")
+        print(f"[TRACK FIN] {track['numero']} | Duracion: {duracion}s")
 
-            # Resetear tracking de frames de entrenamiento
-            self._best_train_area = 0
-            self._best_train_frame = None
-            self._best_train_cls = None
+        with self._tracker_lock:
+            votes          = self._track_votes.copy()
+            numero_inicial = self._track_numero_inicial
+            msg_id         = self._track_msg_id
 
-            with state_lock:
-                STATE["tracking"] = None
-                STATE["tracking_duracion"] = 0
-            self._track_ts = None
-            self._track_frame = None
+        # Determinar ganador por votos
+        winner_num    = numero_inicial or track['numero']
+        winner_conf   = track['conf']
+        winner_estado = track['estado']
+
+        if votes and numero_inicial:
+            conteo = Counter(n for n, c, e in votes)
+            w_num, w_count = conteo.most_common(1)[0]
+            total = len(votes)
+            print(f"[MULTI-LECTURA] {total} lecturas → ganador: {w_num} ({w_count}/{total})")
+            winner_entries = [(c, e) for n, c, e in votes if n == w_num]
+            winner_num    = w_num
+            winner_conf   = max(c for c, e in winner_entries)
+            winner_estado = winner_entries[0][1]
+            if w_num != numero_inicial:
+                print(f"[MULTI-LECTURA] Corrigiendo {numero_inicial} → {w_num}")
+            else:
+                print(f"[MULTI-LECTURA] Ganador confirma: {w_num}")
+
+        # Notificar a alertas.py con numero final y duracion
+        # Si el validador ya respondio, actualizar_pendiente lo ignora silenciosamente
+        actualizar_pendiente(msg_id, winner_num, winner_conf, winner_estado, duracion)
+
+        # Guardar mejor frame limpio para reentrenamiento
+        if self._best_train_frame is not None:
+            ts_train   = datetime.now().strftime("%Y%m%d_%H%M%S")
+            train_name = f"{ts_train}_{winner_num}_clean.jpg"
+            cv2.imwrite(os.path.join(CLEAN_DIR, train_name), self._best_train_frame)
+            print(f"[TRAIN] Guardado frame clean de {winner_num}")
+
+        # Resetear estado
+        self._best_train_area  = 0
+        self._best_train_frame = None
+        self._best_train_cls   = None
+
+        with self._tracker_lock:
+            self._track_votes          = []
+            self._track_numero_inicial = None
+            self._track_no_detectado   = None
+            self._track_msg_id         = None
+
+        with state_lock:
+            STATE["tracking"]          = None
+            STATE["tracking_duracion"] = 0
+
+        self._track_ts    = None
+        self._track_frame = None
 
     def _ocr_worker(self):
-        """Hilo dedicado a OCR pesado. No bloquea el video."""
         while self.running:
             try:
                 job = self._ocr_queue.get(timeout=1.0)
@@ -800,62 +693,46 @@ class InferenceStream:
                     continue
 
                 now = time.time()
-                self._votos = [(t, n, c) for t, n, c in self._votos
-                               if now - t < VOTO_WINDOW]
+                self._votos = [(t, n, c) for t, n, c in self._votos if now - t < VOTO_WINDOW]
                 self._votos.append((now, numero_leido, conf))
 
                 conteo = Counter(n for _, n, _ in self._votos)
                 numero_ganador, veces = conteo.most_common(1)[0]
-
                 if veces < N_VOTOS:
                     continue
 
                 numero_leido = numero_ganador
-                self._votos = []
+                self._votos  = []
 
                 numero_valido, estado = validar_numero(numero_leido)
-
                 if numero_valido is None:
                     numero_valido, estado = recuperar_ocr(numero_leido)
 
                 # -- DESCONOCIDO --
                 if numero_valido is None:
                     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-
                     desc_frame_name = f"{ts_str}_DESCONOCIDA_{numero_leido}.jpg"
                     desc_frame_path = os.path.join(DESCONOCIDAS_DIR, desc_frame_name)
                     desc_frame_save = img.copy()
                     cv2.putText(desc_frame_save, f"DESCONOCIDA: {numero_leido}",
                         (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
                     cv2.imwrite(desc_frame_path, desc_frame_save)
-
-                    desc_crop_name = f"{ts_str}_DESCONOCIDA_{numero_leido}_crop.jpg"
-                    cv2.imwrite(os.path.join(DESCONOCIDAS_DIR, desc_crop_name), crop)
-
-                    # Solo guardar frames limpios lateral/trasero (delantero ya tiene suficientes)
-                    cls_l_desc = cls_name.lower()
-                    if 'lateral' in cls_l_desc or 'trasero' in cls_l_desc or 'trasera' in cls_l_desc:
-                        clean_dest = _clean_dir_for_class(cls_name)
-                        clean_name = f"{ts_str}_DESCONOCIDA_{numero_leido}_clean.jpg"
-                        cv2.imwrite(os.path.join(clean_dest, clean_name), img)
-
+                    cv2.imwrite(os.path.join(DESCONOCIDAS_DIR,
+                        f"{ts_str}_DESCONOCIDA_{numero_leido}_crop.jpg"), crop)
+                    cv2.imwrite(os.path.join(CLEAN_DIR,
+                        f"{ts_str}_DESCONOCIDA_{numero_leido}_clean.jpg"), img)
                     with state_lock:
                         STATE["descartadas"] += 1
-
                     print(f"[DESCONOCIDA] '{numero_leido}'")
-
                     if self._pending_desc_timer:
                         self._pending_desc_timer.cancel()
-
                     ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     self._pending_desc = (desc_frame_path, numero_leido, conf, ts_now)
-
                     def _enviar_si_no_cancelada(datos):
                         fp, num, cnf, ts = datos
                         print(f"[DESCONOCIDA -> Telegram] '{num}' sin correccion tras 4s")
                         alerta_unidad_desconocida(fp, num, cnf, ts)
                         self._pending_desc = None
-
                     self._pending_desc_timer = threading.Timer(
                         4.0, _enviar_si_no_cancelada, args=[self._pending_desc])
                     self._pending_desc_timer.daemon = True
@@ -867,13 +744,20 @@ class InferenceStream:
                     self._pending_desc_timer.cancel()
                     self._pending_desc_timer = None
                     if self._pending_desc:
-                        print(f"[DEBOUNCE] Cancelada DESCONOCIDA '{self._pending_desc[1]}' -> correcta: {numero_valido}")
+                        print(f"[DEBOUNCE] Cancelada DESCONOCIDA '{self._pending_desc[1]}' -> {numero_valido}")
                         self._pending_desc = None
 
                 with self._tracker_lock:
                     track_result = self.tracker.update(bbox, numero_valido, estado, conf)
 
+                # -- TRACKING: acumular voto --
                 if track_result == 'TRACKING':
+                    with self._tracker_lock:
+                        self._track_votes.append((numero_valido, conf, estado))
+                        n_acum = len(self._track_votes)
+                    if n_acum % 5 == 0:
+                        active = self.tracker.active['numero'] if self.tracker.active else '?'
+                        print(f"[MULTI-LECTURA] {n_acum} lecturas | tracker: {active}")
                     continue
 
                 # -- NEW -> Bus nuevo --
@@ -886,19 +770,19 @@ class InferenceStream:
                     (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
                 cv2.rectangle(frame_save, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.imwrite(frame_path, frame_save)
+                cv2.imwrite(os.path.join(CROPS_DIR,
+                    f"{ts_str}_{numero_valido}_crop.jpg"), crop)
+                cv2.imwrite(os.path.join(CLEAN_DIR,
+                    f"{ts_str}_{numero_valido}_clean.jpg"), img)
 
-                crop_name = f"{ts_str}_{numero_valido}_crop.jpg"
-                cv2.imwrite(os.path.join(CROPS_DIR, crop_name), crop)
-
-                # Solo guardar frames limpios lateral/trasero (delantero ya tiene suficientes)
-                cls_l_save = cls_name.lower()
-                if 'lateral' in cls_l_save or 'trasero' in cls_l_save or 'trasera' in cls_l_save:
-                    clean_dest = _clean_dir_for_class(cls_name)
-                    clean_name = f"{ts_str}_{numero_valido}_clean.jpg"
-                    cv2.imwrite(os.path.join(clean_dest, clean_name), img)
-
-                self._track_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self._track_ts    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self._track_frame = frame_name
+
+                with self._tracker_lock:
+                    self._track_votes          = [(numero_valido, conf, estado)]
+                    self._track_numero_inicial = numero_valido
+                    self._track_no_detectado   = numero_leido
+                    self._track_msg_id         = None  # se asigna tras enviar
 
                 with state_lock:
                     STATE["numero"] = numero_valido
@@ -908,21 +792,21 @@ class InferenceStream:
                     STATE["tracking"] = numero_valido
                     STATE["tracking_duracion"] = 0
 
-                db_insert(numero_leido, numero_valido, conf, frame_name, estado, duracion=0)
                 print(f"[NEW {estado}] {numero_valido} | Conf: {conf:.2f} | TRACKING iniciado")
 
+                # Enviar a validador y guardar msg_id
                 ts_now = self._track_ts
-                threading.Thread(
-                    target=enviar_a_validador,
-                    args=(frame_path, numero_valido, conf, ts_now, estado),
-                    daemon=True
-                ).start()
+                msg_id = enviar_a_validador(
+                    frame_path, numero_valido, conf, ts_now, estado,
+                    no_detectado=numero_leido
+                )
+                with self._tracker_lock:
+                    self._track_msg_id = msg_id
 
             except Exception as e:
                 print(f"[OCR ERROR] {e}")
 
     def update(self):
-        """Hilo principal: YOLO + video. Siempre rapido, nunca espera OCR."""
         while self.running:
             img = self.vs.get_frame()
             if img is None:
@@ -942,74 +826,61 @@ class InferenceStream:
                         with _unidades_lock:
                             STATE["unidades_registradas"] = len(UNIDADES)
 
-                # Verificar si el bus rastreado se fue (ligero)
                 with self._tracker_lock:
                     gone_track, gone_dur = self.tracker.check_gone()
                 if gone_track:
                     self._cerrar_track(gone_track, gone_dur)
 
-                # Actualizar duracion en STATE (ligero)
                 with self._tracker_lock:
                     if self.tracker.active:
                         with state_lock:
-                            STATE["tracking"] = self.tracker.active['numero']
+                            STATE["tracking"]          = self.tracker.active['numero']
                             STATE["tracking_duracion"] = self.tracker.get_duration()
 
-                # Encolar crops para OCR (no bloquea)
                 for box in results[0].boxes:
                     conf = float(box.conf[0])
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     bbox = (x1, y1, x2, y2)
-
-                    cls_id = int(box.cls[0])
+                    cls_id   = int(box.cls[0])
                     cls_name = model.names.get(cls_id, "numero")
-
                     box_w, box_h = x2 - x1, y2 - y1
                     aspect = box_w / max(box_h, 1)
                     if aspect > 3.0 or aspect < 0.2:
                         continue
-                    if box_h < 40 or box_w < 40:
+                    # [perf] bbox minimo 60px
+                    if box_h < 60 or box_w < 60:
                         continue
-
                     pad_x, pad_y = 20, 10
                     h_img, w_img = img.shape[:2]
                     crop = img[max(0, y1-pad_y):min(h_img, y2+pad_y),
                                max(0, x1-pad_x):min(w_img, x2+pad_x)]
-
-                    # Rastrear mejor frame lateral/trasero (el mas grande = mas cerca)
-                    cls_lower = cls_name.lower()
-                    if 'lateral' in cls_lower or 'trasero' in cls_lower or 'trasera' in cls_lower:
-                        box_area = box_w * box_h
-                        if box_area > self._best_train_area:
-                            self._best_train_area = box_area
-                            self._best_train_frame = img.copy()
-                            self._best_train_cls = cls_name
-
+                    box_area = box_w * box_h
+                    if box_area > self._best_train_area:
+                        self._best_train_area  = box_area
+                        self._best_train_frame = img.copy()
+                        self._best_train_cls   = cls_name
                     try:
-                        self._ocr_queue.put_nowait(
-                            (img.copy(), crop.copy(), bbox, conf, cls_name))
+                        self._ocr_queue.put_nowait((img.copy(), crop.copy(), bbox, conf, cls_name))
                     except queue.Full:
-                        pass  # OCR atrasado, descartar (el siguiente frame lo atrapa)
+                        pass
 
-                # -- Overlay ligero (solo info, sin numeros OCR) --
+                # Overlay
                 cv2.putText(annotated, f"FPS: {self.fps:.1f}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 cv2.putText(annotated, datetime.now().strftime("%H:%M:%S"),
                     (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-
                 pg_color = (0, 255, 0) if _pg_connected else (0, 0, 255)
                 pg_text  = f"PG: {len(UNIDADES)} uds" if _pg_connected else "PG: DESCONECTADA"
                 cv2.putText(annotated, pg_text,
                     (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, pg_color, 2)
-
                 with self._tracker_lock:
                     if self.tracker.active:
-                        dur = self.tracker.get_duration()
-                        track_text = f"TRACK: {self.tracker.active['numero']} | {dur:.0f}s en camara"
-                        cv2.putText(annotated, track_text,
+                        dur     = self.tracker.get_duration()
+                        n_votos = len(self._track_votes)
+                        cv2.putText(annotated,
+                            f"TRACK: {self.tracker.active['numero']} | {dur:.0f}s | {n_votos} lecturas",
                             (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-                # Empujar a HLS INMEDIATAMENTE (video nunca se congela)
                 with self.lock: self.result = annotated
                 with hls_lock: hls_push_frame(annotated)
 
@@ -1022,8 +893,7 @@ class InferenceStream:
 
     def stop(self):
         self.running = False
-        if self.cap:
-            self.cap.release()
+        if self.cap: self.cap.release()
 
 
 # ==============================================================================
@@ -1062,8 +932,7 @@ def api_hls_ping():
     global hls_last_ping
     with hls_lock:
         hls_last_ping = time.time()
-        if not hls_active:
-            hls_start()
+        if not hls_active: hls_start()
     return jsonify({"hls": "alive"})
 
 @app.route('/hls/<path:filename>')
@@ -1114,12 +983,9 @@ def api_unidades():
 def health():
     with state_lock:
         return jsonify({
-            "status": "ok",
-            "fps": STATE["fps"],
-            "pipeline": STATE["pipeline"],
-            "hls": hls_active,
-            "pg_conectada": _pg_connected,
-            "unidades_pg": len(UNIDADES),
+            "status": "ok", "fps": STATE["fps"],
+            "pipeline": STATE["pipeline"], "hls": hls_active,
+            "pg_conectada": _pg_connected, "unidades_pg": len(UNIDADES),
             "descartadas": STATE["descartadas"],
             "tracking": STATE["tracking"],
             "tracking_duracion": STATE["tracking_duracion"]
@@ -1132,13 +998,12 @@ def health():
 if __name__ == '__main__':
     print(f"[INFO] Servidor en http://{FLASK_HOST}:{FLASK_PORT}")
     print(f"[INFO] PostgreSQL: {'CONECTADA' if _pg_connected else 'DESCONECTADA'} — {len(UNIDADES)} unidades")
-    print(f"[INFO] Modo: VALIDACION ESTRICTA — solo acepta unidades en PG")
-    print(f"[INFO] Tracker: IoU + numero (costo: ~0 CPU)")
+    print(f"[INFO] SQLite: solo guarda detecciones aprobadas por el validador")
+    print(f"[INFO] Multi-lectura: acumula votos, actualiza pendiente al salir")
     try:
         app.run(host=FLASK_HOST, port=FLASK_PORT, threaded=True, use_reloader=False)
     except KeyboardInterrupt:
         print("\n[INFO] Deteniendo...")
-        with hls_lock:
-            hls_stop()
+        with hls_lock: hls_stop()
         stream.stop()
         inference.stop()
