@@ -3,12 +3,16 @@ CISA - Sistema de Deteccion y Monitoreo de Unidades de Transporte
 Pipeline: RTSP -> GStreamer -> YOLO -> OCR -> Validacion PG -> Tracking -> Alertas
 
 Cambios:
-  refactor: modelo 1 clase 'numero' — eliminados filtros lateral/trasero/delantero
-  perf: bbox minimo 40px → 60px
-  feat: multi-lectura durante tracking — acumula votos, actualiza pendiente al salir
+  refactor: modelo 1 clase 'numero'
+  perf: bbox 60px → 50px para capturar laterales
+  feat: multi-lectura durante tracking
   feat: SQLite solo guarda detecciones aprobadas por validador
-  feat: NEW guarda solo frame limpio sin bounding box — sin crop ni clean
-  diag: imwrite de frame clean en _cerrar_track comentado — verificando lag
+  feat: frame limpio sin bounding box
+  fix: correccion de trasposiciones de digitos en validar_numero
+  fix: correccion de digitos duplicados en validar_numero
+  fix: preprocesamiento OCR nocturno mas agresivo (22:00-06:00)
+  fix: N_VOTOS aumentado de noche para reducir falsos positivos nocturnos
+  diag: imwrite de frame clean en _cerrar_track comentado
 """
 
 import cv2
@@ -254,6 +258,37 @@ def levenshtein(a, b):
     return dp[n]
 
 
+def _corregir_trasposicion(leido, unidades_4d5):
+    """
+    Intenta corregir trasposiciones de digitos adyacentes.
+    Ejemplos: 5300→5030, 5539→5039, 5346→5036
+    """
+    for i in range(len(leido) - 1):
+        transpuesto = leido[:i] + leido[i+1] + leido[i] + leido[i+2:]
+        if transpuesto in unidades_4d5:
+            print(f"[CORREGIDO] '{leido}' -> '{transpuesto}' (trasposicion pos {i})")
+            return transpuesto, "CORREGIDO"
+    return None, None
+
+
+def _corregir_digito_duplicado(leido, unidades_4d5):
+    """
+    Intenta corregir digitos duplicados adyacentes.
+    Ejemplos: 5255→5025, 5557→5057, 5552→5052
+    El patron es que OCR lee un digito dos veces seguidas.
+    """
+    for i in range(1, len(leido) - 1):
+        if leido[i] == leido[i+1]:
+            # Eliminar el duplicado y rellenar con '0' para mantener 4 digitos
+            sin_dup = leido[:i+1] + leido[i+2:]   # quitar segundo del par
+            if len(sin_dup) == 3:
+                candidato = sin_dup[0] + '0' + sin_dup[1:]  # insertar 0 en pos 1
+                if candidato in unidades_4d5:
+                    print(f"[CORREGIDO] '{leido}' -> '{candidato}' (digito duplicado pos {i})")
+                    return candidato, "CORREGIDO"
+    return None, None
+
+
 def validar_numero(leido):
     leido = leido.strip()
     with _unidades_lock:
@@ -264,10 +299,12 @@ def validar_numero(leido):
 
     unidades_4d5 = {u for u in unidades_snapshot if len(u) == 4 and u.startswith('5')}
 
+    # CASO 1: 4 digitos empezando con 5
     if len(leido) == 4 and leido.startswith('5'):
         if leido in unidades_4d5:
             print(f"[VERIFICADO] '{leido}' existe en PostgreSQL")
             return leido, "VERIFICADO"
+        # Levenshtein
         mejor, mejor_dist = None, 999
         for u in unidades_4d5:
             d = levenshtein(leido, u)
@@ -275,9 +312,16 @@ def validar_numero(leido):
         if mejor_dist <= LEVENSHTEIN_MAX:
             print(f"[CORREGIDO] '{leido}' -> '{mejor}' (Lev={mejor_dist})")
             return mejor, "CORREGIDO"
+        # Trasposicion de digitos (5300→5030, 5539→5039)
+        r, e = _corregir_trasposicion(leido, unidades_4d5)
+        if r: return r, e
+        # Digito duplicado (5255→5025, 5557→5057)
+        r, e = _corregir_digito_duplicado(leido, unidades_4d5)
+        if r: return r, e
         print(f"[DESCARTADO] '{leido}' sin match 4dig (mejor: {mejor}, dist={mejor_dist})")
         return None, None
 
+    # CASO 2: 3 digitos empezando con 5
     if len(leido) == 3 and leido[0] == '5':
         if leido in unidades_snapshot:
             print(f"[VERIFICADO] '{leido}' existe como 3-dig en PG")
@@ -296,6 +340,7 @@ def validar_numero(leido):
         print(f"[DESCARTADO] '{leido}' sin match 3dig ni 4dig")
         return None, None
 
+    # CASO 3: 4 digitos que NO empiezan con 5
     if len(leido) == 4 and leido[0] != '5':
         normalizado = '5' + leido[1:]
         if normalizado in unidades_4d5:
@@ -308,9 +353,13 @@ def validar_numero(leido):
         if mejor_dist <= LEVENSHTEIN_MAX:
             print(f"[CORREGIDO] '{leido}' -> '{normalizado}' -> '{mejor}' (Lev={mejor_dist})")
             return mejor, "CORREGIDO"
+        # Intentar trasposicion sobre el normalizado
+        r, e = _corregir_trasposicion(normalizado, unidades_4d5)
+        if r: return r, e
         print(f"[DESCARTADO] '{leido}' -> '{normalizado}' sin match")
         return None, None
 
+    # CASO 4: 3 digitos sin 5
     if len(leido) == 3 and leido[0] != '5':
         candidato = '5' + leido
         if candidato in unidades_4d5:
@@ -371,8 +420,15 @@ def recuperar_ocr(leido):
 
 # ==============================================================================
 # Tesseract OCR
+# Con preprocesamiento adaptado segun hora del dia
 # ==============================================================================
 print("[INFO] Tesseract OCR listo.")
+
+
+def _es_noche():
+    """Retorna True entre 22:00 y 06:00 — horas con peor iluminacion."""
+    h = datetime.now().hour
+    return h >= 22 or h <= 6
 
 
 def leer_numero(crop):
@@ -380,32 +436,50 @@ def leer_numero(crop):
         h, w = crop.shape[:2]
         if h < OCR_MIN_SIZE or w < OCR_MIN_SIZE:
             return None
+
         scale = max(1, OCR_TARGET_H // h)
         crop_up = cv2.resize(crop, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(crop_up, cv2.COLOR_BGR2GRAY)
-        gray = cv2.fastNlMeansDenoising(gray, h=12, templateWindowSize=7, searchWindowSize=21)
+
+        noche = _es_noche()
+
+        # Denoising — mas agresivo de noche para eliminar ruido de baja iluminacion
+        h_denoise = 18 if noche else 12
+        gray = cv2.fastNlMeansDenoising(gray, h=h_denoise, templateWindowSize=7, searchWindowSize=21)
+
+        # Sharpening — mas fuerte de noche para recuperar bordes
+        alpha = 2.2 if noche else 1.8
         blur = cv2.GaussianBlur(gray, (0, 0), 2.0)
-        gray = cv2.addWeighted(gray, 1.8, blur, -0.8, 0)
+        gray = cv2.addWeighted(gray, alpha, blur, -(alpha - 1), 0)
+
         kern = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         resultados = []
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+
+        # CLAHE — clip mas alto de noche para aumentar contraste local
+        clip = 4.0 if noche else 3.0
+        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(4, 4))
         g1 = clahe.apply(gray)
         _, g1 = cv2.threshold(g1, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         g1 = cv2.morphologyEx(g1, cv2.MORPH_CLOSE, kern)
         g1 = cv2.morphologyEx(g1, cv2.MORPH_OPEN, kern)
+
         g2 = cv2.adaptiveThreshold(gray, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 8)
         g2 = cv2.morphologyEx(g2, cv2.MORPH_CLOSE, kern)
+
         g3 = cv2.bitwise_not(g1)
+
         g4_blur = cv2.bilateralFilter(gray, 9, 75, 75)
         _, g4 = cv2.threshold(g4_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         g4 = cv2.morphologyEx(g4, cv2.MORPH_CLOSE, kern)
+
         config = '--psm 7 -c tessedit_char_whitelist=0123456789'
         for img_proc in [g1, g2, g3, g4]:
             texto = pytesseract.image_to_string(img_proc, config=config).strip()
             limpio = re.sub(r'[^0-9]', '', texto)[:OCR_MAX_DIGITS]
             if len(limpio) >= OCR_MIN_DIGITS:
                 resultados.append(limpio)
+
         if not resultados:
             config8 = '--psm 8 -c tessedit_char_whitelist=0123456789'
             for img_proc in [g1, g4]:
@@ -413,9 +487,12 @@ def leer_numero(crop):
                 limpio = re.sub(r'[^0-9]', '', texto)[:OCR_MAX_DIGITS]
                 if len(limpio) >= OCR_MIN_DIGITS:
                     resultados.append(limpio)
+
         if not resultados:
             return None
+
         return Counter(resultados).most_common(1)[0][0]
+
     except Exception as e:
         print(f"[OCR ERROR] {e}"); return None
 
@@ -566,10 +643,8 @@ class InferenceStream:
     """
     Flujo de archivos en disco:
     - NEW: guarda UN solo frame limpio (sin bounding box) en FRAMES_DIR
-           No guarda crop ni clean.
-    - _on_correcto (alertas): inserta SQLite, envia a grupo, borra frame del disco
+    - _on_correcto (alertas): inserta SQLite, envia a grupo, borra frame
     - _on_incorrecto (alertas): mueve frame a /revisar, borra de FRAMES_DIR
-    - En disco solo vive el frame temporalmente hasta que el validador responde.
     """
     def __init__(self, vs):
         self.lock = threading.Lock()
@@ -679,7 +754,10 @@ class InferenceStream:
 
                 conteo = Counter(n for _, n, _ in self._votos)
                 numero_ganador, veces = conteo.most_common(1)[0]
-                if veces < N_VOTOS:
+
+                # De noche se exigen mas votos antes de aceptar
+                n_votos_req = 3 if _es_noche() else N_VOTOS
+                if veces < n_votos_req:
                     continue
 
                 numero_leido = numero_ganador
@@ -692,27 +770,21 @@ class InferenceStream:
                 # -- DESCONOCIDO --
                 if numero_valido is None:
                     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    # Solo frame limpio en desconocidas, sin bounding box
-                    desc_frame_name = f"{ts_str}_DESCONOCIDA_{numero_leido}.jpg"
-                    desc_frame_path = os.path.join(DESCONOCIDAS_DIR, desc_frame_name)
+                    desc_frame_path = os.path.join(DESCONOCIDAS_DIR,
+                        f"{ts_str}_DESCONOCIDA_{numero_leido}.jpg")
                     cv2.imwrite(desc_frame_path, img)
-
                     with state_lock:
                         STATE["descartadas"] += 1
                     print(f"[DESCONOCIDA] '{numero_leido}'")
-
                     if self._pending_desc_timer:
                         self._pending_desc_timer.cancel()
-
                     ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     self._pending_desc = (desc_frame_path, numero_leido, conf, ts_now)
-
                     def _enviar_si_no_cancelada(datos):
                         fp, num, cnf, ts = datos
                         print(f"[DESCONOCIDA -> Telegram] '{num}' sin correccion tras 4s")
                         alerta_unidad_desconocida(fp, num, cnf, ts)
                         self._pending_desc = None
-
                     self._pending_desc_timer = threading.Timer(
                         4.0, _enviar_si_no_cancelada, args=[self._pending_desc])
                     self._pending_desc_timer.daemon = True
@@ -743,9 +815,7 @@ class InferenceStream:
                 # -- NEW -> Bus nuevo --
                 ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-                # Frame LIMPIO — sin bounding box, sin texto anotado
-                # Es el unico archivo que se guarda temporalmente en disco
-                # hasta que el validador responda
+                # Frame LIMPIO — sin bounding box ni texto
                 frame_name = f"{ts_str}_{numero_valido}.jpg"
                 frame_path = os.path.join(FRAMES_DIR, frame_name)
                 cv2.imwrite(frame_path, img)
@@ -767,7 +837,8 @@ class InferenceStream:
                     STATE["tracking"] = numero_valido
                     STATE["tracking_duracion"] = 0
 
-                print(f"[NEW {estado}] {numero_valido} | Conf: {conf:.2f} | TRACKING iniciado")
+                modo = "NOCHE" if _es_noche() else "DIA"
+                print(f"[NEW {estado}] {numero_valido} | Conf: {conf:.2f} | {modo} | TRACKING iniciado")
 
                 ts_now = self._track_ts
                 msg_id = enviar_a_validador(
@@ -821,7 +892,8 @@ class InferenceStream:
                     aspect = box_w / max(box_h, 1)
                     if aspect > 3.0 or aspect < 0.2:
                         continue
-                    if box_h < 60 or box_w < 60:
+                    # [perf] bbox minimo 50px — detecta laterales sin sacrificar calidad
+                    if box_h < 50 or box_w < 50:
                         continue
                     pad_x, pad_y = 20, 10
                     h_img, w_img = img.shape[:2]
@@ -838,7 +910,8 @@ class InferenceStream:
                         pass
 
                 # Overlay
-                cv2.putText(annotated, f"FPS: {self.fps:.1f}",
+                modo_str = "🌙 NOCHE" if _es_noche() else "☀ DIA"
+                cv2.putText(annotated, f"FPS: {self.fps:.1f} {modo_str}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 cv2.putText(annotated, datetime.now().strftime("%H:%M:%S"),
                     (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
@@ -972,7 +1045,8 @@ if __name__ == '__main__':
     print(f"[INFO] Servidor en http://{FLASK_HOST}:{FLASK_PORT}")
     print(f"[INFO] PostgreSQL: {'CONECTADA' if _pg_connected else 'DESCONECTADA'} — {len(UNIDADES)} unidades")
     print(f"[INFO] SQLite: solo guarda detecciones aprobadas por el validador")
-    print(f"[INFO] Frames: solo frame limpio temporal, se borra tras validacion")
+    print(f"[INFO] OCR: preprocesamiento adaptado dia/noche")
+    print(f"[INFO] bbox minimo: 50px (laterales habilitados)")
     try:
         app.run(host=FLASK_HOST, port=FLASK_PORT, threaded=True, use_reloader=False)
     except KeyboardInterrupt:
