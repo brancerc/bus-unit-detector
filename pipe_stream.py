@@ -7,6 +7,7 @@ Cambios:
   perf: bbox minimo 40px → 60px
   feat: multi-lectura durante tracking — acumula votos, actualiza pendiente al salir
   feat: SQLite solo guarda detecciones aprobadas por validador (db_insert en alertas._on_correcto)
+  diag: imwrite de frame limpio comentado — verificar si era causa del lag en video
 """
 
 import cv2
@@ -593,10 +594,10 @@ class InferenceStream:
         self._tracker_lock = threading.Lock()
         self._track_ts     = None
         self._track_frame  = None
-        self._track_msg_id = None          # msg_id del mensaje Telegram pendiente
+        self._track_msg_id = None
 
         # Multi-lectura
-        self._track_votes          = []    # (numero_valido, conf, estado)
+        self._track_votes          = []
         self._track_numero_inicial = None
         self._track_no_detectado   = None
 
@@ -613,12 +614,6 @@ class InferenceStream:
         print("[INFO] Hilo OCR separado iniciado.")
 
     def _cerrar_track(self, track, duracion):
-        """
-        Bus salio de camara.
-        Determina numero ganador por votos y notifica a alertas.py via
-        actualizar_pendiente() para que cuando el validador apruebe,
-        SQLite reciba el numero correcto y la duracion real.
-        """
         if not track or not self._track_ts:
             return
 
@@ -649,15 +644,15 @@ class InferenceStream:
                 print(f"[MULTI-LECTURA] Ganador confirma: {w_num}")
 
         # Notificar a alertas.py con numero final y duracion
-        # Si el validador ya respondio, actualizar_pendiente lo ignora silenciosamente
         actualizar_pendiente(msg_id, winner_num, winner_conf, winner_estado, duracion)
 
-        # Guardar mejor frame limpio para reentrenamiento
-        if self._best_train_frame is not None:
-            ts_train   = datetime.now().strftime("%Y%m%d_%H%M%S")
-            train_name = f"{ts_train}_{winner_num}_clean.jpg"
-            cv2.imwrite(os.path.join(CLEAN_DIR, train_name), self._best_train_frame)
-            print(f"[TRAIN] Guardado frame clean de {winner_num}")
+        # COMENTADO TEMPORALMENTE — diagnostico de lag en video
+        # Si el lag desaparece, este bloque se movera a un hilo separado
+        # if self._best_train_frame is not None:
+        #     ts_train   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        #     train_name = f"{ts_train}_{winner_num}_clean.jpg"
+        #     cv2.imwrite(os.path.join(CLEAN_DIR, train_name), self._best_train_frame)
+        #     print(f"[TRAIN] Guardado frame clean de {winner_num}")
 
         # Resetear estado
         self._best_train_area  = 0
@@ -782,7 +777,7 @@ class InferenceStream:
                     self._track_votes          = [(numero_valido, conf, estado)]
                     self._track_numero_inicial = numero_valido
                     self._track_no_detectado   = numero_leido
-                    self._track_msg_id         = None  # se asigna tras enviar
+                    self._track_msg_id         = None
 
                 with state_lock:
                     STATE["numero"] = numero_valido
@@ -794,7 +789,6 @@ class InferenceStream:
 
                 print(f"[NEW {estado}] {numero_valido} | Conf: {conf:.2f} | TRACKING iniciado")
 
-                # Enviar a validador y guardar msg_id
                 ts_now = self._track_ts
                 msg_id = enviar_a_validador(
                     frame_path, numero_valido, conf, ts_now, estado,
@@ -847,7 +841,6 @@ class InferenceStream:
                     aspect = box_w / max(box_h, 1)
                     if aspect > 3.0 or aspect < 0.2:
                         continue
-                    # [perf] bbox minimo 60px
                     if box_h < 60 or box_w < 60:
                         continue
                     pad_x, pad_y = 20, 10
@@ -1000,6 +993,7 @@ if __name__ == '__main__':
     print(f"[INFO] PostgreSQL: {'CONECTADA' if _pg_connected else 'DESCONECTADA'} — {len(UNIDADES)} unidades")
     print(f"[INFO] SQLite: solo guarda detecciones aprobadas por el validador")
     print(f"[INFO] Multi-lectura: acumula votos, actualiza pendiente al salir")
+    print(f"[INFO] DIAG: imwrite de frame clean comentado — verificando lag")
     try:
         app.run(host=FLASK_HOST, port=FLASK_PORT, threaded=True, use_reloader=False)
     except KeyboardInterrupt:
