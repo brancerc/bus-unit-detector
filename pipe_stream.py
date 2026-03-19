@@ -4,14 +4,19 @@ Pipeline: RTSP -> GStreamer -> YOLO -> OCR -> Validacion PG -> Tracking -> Alert
 
 Cambios:
   refactor: modelo 1 clase 'numero'
-  perf: bbox 60px → 50px para capturar laterales
+  perf: bbox 50px para capturar laterales
   feat: multi-lectura durante tracking
   feat: SQLite solo guarda detecciones aprobadas por validador
   feat: frame limpio sin bounding box
-  fix: correccion de trasposiciones de digitos en validar_numero
-  fix: correccion de digitos duplicados en validar_numero
+  fix: correccion de trasposiciones y digitos duplicados en validar_numero
   fix: preprocesamiento OCR nocturno mas agresivo (22:00-06:00)
-  fix: N_VOTOS aumentado de noche para reducir falsos positivos nocturnos
+  fix: N_VOTOS aumentado de noche
+  perf: img.copy() una sola vez por frame (no por cada caja detectada)
+  perf: _cerrar_track movido a hilo separado — no bloquea el video
+  perf: results[0].plot() solo cuando hay clientes HLS activos
+  perf: cv2.imwrite de NEW en hilo separado — no bloquea el OCR worker
+  perf: HLS hls_time=1s, hls_list_size=3 — menor latencia en navegador
+  diag: tracker check_gone + _cerrar_track comentados — diagnostico de lag
   diag: imwrite de frame clean en _cerrar_track comentado
 """
 
@@ -170,7 +175,6 @@ threading.Thread(target=_refresh_unidades_loop, daemon=True).start()
 
 # ==============================================================================
 # SQLite — solo esquema e inicializacion
-# db_insert vive en alertas._on_correcto, se llama solo al aprobar
 # ==============================================================================
 
 def init_db():
@@ -259,10 +263,6 @@ def levenshtein(a, b):
 
 
 def _corregir_trasposicion(leido, unidades_4d5):
-    """
-    Intenta corregir trasposiciones de digitos adyacentes.
-    Ejemplos: 5300→5030, 5539→5039, 5346→5036
-    """
     for i in range(len(leido) - 1):
         transpuesto = leido[:i] + leido[i+1] + leido[i] + leido[i+2:]
         if transpuesto in unidades_4d5:
@@ -272,17 +272,11 @@ def _corregir_trasposicion(leido, unidades_4d5):
 
 
 def _corregir_digito_duplicado(leido, unidades_4d5):
-    """
-    Intenta corregir digitos duplicados adyacentes.
-    Ejemplos: 5255→5025, 5557→5057, 5552→5052
-    El patron es que OCR lee un digito dos veces seguidas.
-    """
     for i in range(1, len(leido) - 1):
         if leido[i] == leido[i+1]:
-            # Eliminar el duplicado y rellenar con '0' para mantener 4 digitos
-            sin_dup = leido[:i+1] + leido[i+2:]   # quitar segundo del par
+            sin_dup = leido[:i+1] + leido[i+2:]
             if len(sin_dup) == 3:
-                candidato = sin_dup[0] + '0' + sin_dup[1:]  # insertar 0 en pos 1
+                candidato = sin_dup[0] + '0' + sin_dup[1:]
                 if candidato in unidades_4d5:
                     print(f"[CORREGIDO] '{leido}' -> '{candidato}' (digito duplicado pos {i})")
                     return candidato, "CORREGIDO"
@@ -299,12 +293,10 @@ def validar_numero(leido):
 
     unidades_4d5 = {u for u in unidades_snapshot if len(u) == 4 and u.startswith('5')}
 
-    # CASO 1: 4 digitos empezando con 5
     if len(leido) == 4 and leido.startswith('5'):
         if leido in unidades_4d5:
             print(f"[VERIFICADO] '{leido}' existe en PostgreSQL")
             return leido, "VERIFICADO"
-        # Levenshtein
         mejor, mejor_dist = None, 999
         for u in unidades_4d5:
             d = levenshtein(leido, u)
@@ -312,16 +304,13 @@ def validar_numero(leido):
         if mejor_dist <= LEVENSHTEIN_MAX:
             print(f"[CORREGIDO] '{leido}' -> '{mejor}' (Lev={mejor_dist})")
             return mejor, "CORREGIDO"
-        # Trasposicion de digitos (5300→5030, 5539→5039)
         r, e = _corregir_trasposicion(leido, unidades_4d5)
         if r: return r, e
-        # Digito duplicado (5255→5025, 5557→5057)
         r, e = _corregir_digito_duplicado(leido, unidades_4d5)
         if r: return r, e
         print(f"[DESCARTADO] '{leido}' sin match 4dig (mejor: {mejor}, dist={mejor_dist})")
         return None, None
 
-    # CASO 2: 3 digitos empezando con 5
     if len(leido) == 3 and leido[0] == '5':
         if leido in unidades_snapshot:
             print(f"[VERIFICADO] '{leido}' existe como 3-dig en PG")
@@ -340,7 +329,6 @@ def validar_numero(leido):
         print(f"[DESCARTADO] '{leido}' sin match 3dig ni 4dig")
         return None, None
 
-    # CASO 3: 4 digitos que NO empiezan con 5
     if len(leido) == 4 and leido[0] != '5':
         normalizado = '5' + leido[1:]
         if normalizado in unidades_4d5:
@@ -353,13 +341,11 @@ def validar_numero(leido):
         if mejor_dist <= LEVENSHTEIN_MAX:
             print(f"[CORREGIDO] '{leido}' -> '{normalizado}' -> '{mejor}' (Lev={mejor_dist})")
             return mejor, "CORREGIDO"
-        # Intentar trasposicion sobre el normalizado
         r, e = _corregir_trasposicion(normalizado, unidades_4d5)
         if r: return r, e
         print(f"[DESCARTADO] '{leido}' -> '{normalizado}' sin match")
         return None, None
 
-    # CASO 4: 3 digitos sin 5
     if len(leido) == 3 and leido[0] != '5':
         candidato = '5' + leido
         if candidato in unidades_4d5:
@@ -419,14 +405,12 @@ def recuperar_ocr(leido):
 
 
 # ==============================================================================
-# Tesseract OCR
-# Con preprocesamiento adaptado segun hora del dia
+# Tesseract OCR con modo dia/noche
 # ==============================================================================
 print("[INFO] Tesseract OCR listo.")
 
 
 def _es_noche():
-    """Retorna True entre 22:00 y 06:00 — horas con peor iluminacion."""
     h = datetime.now().hour
     return h >= 22 or h <= 6
 
@@ -436,50 +420,36 @@ def leer_numero(crop):
         h, w = crop.shape[:2]
         if h < OCR_MIN_SIZE or w < OCR_MIN_SIZE:
             return None
-
         scale = max(1, OCR_TARGET_H // h)
         crop_up = cv2.resize(crop, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(crop_up, cv2.COLOR_BGR2GRAY)
-
         noche = _es_noche()
-
-        # Denoising — mas agresivo de noche para eliminar ruido de baja iluminacion
         h_denoise = 18 if noche else 12
         gray = cv2.fastNlMeansDenoising(gray, h=h_denoise, templateWindowSize=7, searchWindowSize=21)
-
-        # Sharpening — mas fuerte de noche para recuperar bordes
         alpha = 2.2 if noche else 1.8
         blur = cv2.GaussianBlur(gray, (0, 0), 2.0)
         gray = cv2.addWeighted(gray, alpha, blur, -(alpha - 1), 0)
-
         kern = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         resultados = []
-
-        # CLAHE — clip mas alto de noche para aumentar contraste local
         clip = 4.0 if noche else 3.0
         clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(4, 4))
         g1 = clahe.apply(gray)
         _, g1 = cv2.threshold(g1, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         g1 = cv2.morphologyEx(g1, cv2.MORPH_CLOSE, kern)
         g1 = cv2.morphologyEx(g1, cv2.MORPH_OPEN, kern)
-
         g2 = cv2.adaptiveThreshold(gray, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 8)
         g2 = cv2.morphologyEx(g2, cv2.MORPH_CLOSE, kern)
-
         g3 = cv2.bitwise_not(g1)
-
         g4_blur = cv2.bilateralFilter(gray, 9, 75, 75)
         _, g4 = cv2.threshold(g4_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         g4 = cv2.morphologyEx(g4, cv2.MORPH_CLOSE, kern)
-
         config = '--psm 7 -c tessedit_char_whitelist=0123456789'
         for img_proc in [g1, g2, g3, g4]:
             texto = pytesseract.image_to_string(img_proc, config=config).strip()
             limpio = re.sub(r'[^0-9]', '', texto)[:OCR_MAX_DIGITS]
             if len(limpio) >= OCR_MIN_DIGITS:
                 resultados.append(limpio)
-
         if not resultados:
             config8 = '--psm 8 -c tessedit_char_whitelist=0123456789'
             for img_proc in [g1, g4]:
@@ -487,12 +457,9 @@ def leer_numero(crop):
                 limpio = re.sub(r'[^0-9]', '', texto)[:OCR_MAX_DIGITS]
                 if len(limpio) >= OCR_MIN_DIGITS:
                     resultados.append(limpio)
-
         if not resultados:
             return None
-
         return Counter(resultados).most_common(1)[0][0]
-
     except Exception as e:
         print(f"[OCR ERROR] {e}"); return None
 
@@ -519,6 +486,7 @@ state_lock = threading.Lock()
 
 # ==============================================================================
 # HLS bajo demanda
+# [perf] hls_time=1s y hls_list_size=3 — menor latencia en navegador
 # ==============================================================================
 hls_lock      = threading.Lock()
 hls_last_ping = 0
@@ -539,7 +507,9 @@ def hls_start():
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{w}x{h}', '-pix_fmt', 'bgr24', '-r', str(HLS_FPS), '-i', '-',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
-        '-f', 'hls', '-hls_time', '2', '-hls_list_size', '10',
+        '-f', 'hls',
+        '-hls_time', '1',           # [perf] segmentos de 1s (antes 2s)
+        '-hls_list_size', '3',      # [perf] solo 3 segmentos en playlist (antes 10)
         '-hls_flags', 'delete_segments+append_list',
         '-hls_segment_type', 'mpegts',
         '-hls_segment_filename', f'{HLS_DIR}/seg%03d.ts',
@@ -640,12 +610,6 @@ class VideoStream:
 # ==============================================================================
 
 class InferenceStream:
-    """
-    Flujo de archivos en disco:
-    - NEW: guarda UN solo frame limpio (sin bounding box) en FRAMES_DIR
-    - _on_correcto (alertas): inserta SQLite, envia a grupo, borra frame
-    - _on_incorrecto (alertas): mueve frame a /revisar, borra de FRAMES_DIR
-    """
     def __init__(self, vs):
         self.lock = threading.Lock()
         self.result = None
@@ -678,6 +642,10 @@ class InferenceStream:
         print("[INFO] Hilo OCR separado iniciado.")
 
     def _cerrar_track(self, track, duracion):
+        """
+        Corre en hilo separado — no bloquea el video.
+        [diag] Tracker comentado — verificando si era causa del lag
+        """
         if not track or not self._track_ts:
             return
 
@@ -708,8 +676,7 @@ class InferenceStream:
 
         actualizar_pendiente(msg_id, winner_num, winner_conf, winner_estado, duracion)
 
-        # COMENTADO TEMPORALMENTE — diagnostico de lag en video
-        # Si el lag desaparece, este bloque se movera a un hilo separado
+        # COMENTADO — diagnostico de lag
         # if self._best_train_frame is not None:
         #     ts_train   = datetime.now().strftime("%Y%m%d_%H%M%S")
         #     train_name = f"{ts_train}_{winner_num}_clean.jpg"
@@ -755,7 +722,6 @@ class InferenceStream:
                 conteo = Counter(n for _, n, _ in self._votos)
                 numero_ganador, veces = conteo.most_common(1)[0]
 
-                # De noche se exigen mas votos antes de aceptar
                 n_votos_req = 3 if _es_noche() else N_VOTOS
                 if veces < n_votos_req:
                     continue
@@ -772,7 +738,11 @@ class InferenceStream:
                     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
                     desc_frame_path = os.path.join(DESCONOCIDAS_DIR,
                         f"{ts_str}_DESCONOCIDA_{numero_leido}.jpg")
-                    cv2.imwrite(desc_frame_path, img)
+                    # [perf] imwrite en hilo separado
+                    threading.Thread(
+                        target=cv2.imwrite,
+                        args=(desc_frame_path, img.copy()),
+                        daemon=True).start()
                     with state_lock:
                         STATE["descartadas"] += 1
                     print(f"[DESCONOCIDA] '{numero_leido}'")
@@ -802,7 +772,6 @@ class InferenceStream:
                 with self._tracker_lock:
                     track_result = self.tracker.update(bbox, numero_valido, estado, conf)
 
-                # -- TRACKING: acumular voto --
                 if track_result == 'TRACKING':
                     with self._tracker_lock:
                         self._track_votes.append((numero_valido, conf, estado))
@@ -812,13 +781,17 @@ class InferenceStream:
                         print(f"[MULTI-LECTURA] {n_acum} lecturas | tracker: {active}")
                     continue
 
-                # -- NEW -> Bus nuevo --
-                ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-                # Frame LIMPIO — sin bounding box ni texto
+                # -- NEW --
+                ts_str     = datetime.now().strftime("%Y%m%d_%H%M%S")
                 frame_name = f"{ts_str}_{numero_valido}.jpg"
                 frame_path = os.path.join(FRAMES_DIR, frame_name)
-                cv2.imwrite(frame_path, img)
+
+                # [perf] imwrite en hilo separado — no bloquea el OCR worker
+                img_save = img.copy()
+                threading.Thread(
+                    target=cv2.imwrite,
+                    args=(frame_path, img_save),
+                    daemon=True).start()
 
                 self._track_ts    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self._track_frame = frame_name
@@ -852,13 +825,25 @@ class InferenceStream:
                 print(f"[OCR ERROR] {e}")
 
     def update(self):
+        """
+        Hilo principal de inferencia.
+        [perf] img.copy() una sola vez por frame antes del loop de cajas
+        [perf] results[0].plot() solo cuando hay clientes HLS activos
+        [diag] tracker check_gone + _cerrar_track comentados — verificando lag
+        """
         while self.running:
             img = self.vs.get_frame()
             if img is None:
                 time.sleep(0.05); continue
             try:
-                results   = model.predict(img, conf=MODEL_CONF, device=0, verbose=False)
-                annotated = results[0].plot()
+                results = model.predict(img, conf=MODEL_CONF, device=0, verbose=False)
+
+                # [perf] Solo dibujar cajas si hay alguien viendo el stream
+                # Ahorra CPU cuando no hay clientes conectados
+                if hls_active:
+                    annotated = results[0].plot()
+                else:
+                    annotated = img
 
                 self._cnt += 1
                 elapsed = time.time() - self._t
@@ -871,16 +856,27 @@ class InferenceStream:
                         with _unidades_lock:
                             STATE["unidades_registradas"] = len(UNIDADES)
 
-                with self._tracker_lock:
-                    gone_track, gone_dur = self.tracker.check_gone()
-                if gone_track:
-                    self._cerrar_track(gone_track, gone_dur)
+                # [diag] TRACKER COMENTADO — verificando si causa lag
+                # Si el video mejora sin esto, el tracker se mueve a hilo separado
+                # with self._tracker_lock:
+                #     gone_track, gone_dur = self.tracker.check_gone()
+                # if gone_track:
+                #     threading.Thread(
+                #         target=self._cerrar_track,
+                #         args=(gone_track, gone_dur),
+                #         daemon=True).start()
 
+                # Actualizar duracion en STATE
                 with self._tracker_lock:
                     if self.tracker.active:
                         with state_lock:
                             STATE["tracking"]          = self.tracker.active['numero']
                             STATE["tracking_duracion"] = self.tracker.get_duration()
+
+                # [perf] UNA SOLA copia del frame antes del loop
+                # Antes: img.copy() por cada caja = N copias por frame
+                # Ahora: una copia compartida para todas las cajas
+                img_snapshot = img.copy()
 
                 for box in results[0].boxes:
                     conf = float(box.conf[0])
@@ -892,7 +888,6 @@ class InferenceStream:
                     aspect = box_w / max(box_h, 1)
                     if aspect > 3.0 or aspect < 0.2:
                         continue
-                    # [perf] bbox minimo 50px — detecta laterales sin sacrificar calidad
                     if box_h < 50 or box_w < 50:
                         continue
                     pad_x, pad_y = 20, 10
@@ -902,30 +897,32 @@ class InferenceStream:
                     box_area = box_w * box_h
                     if box_area > self._best_train_area:
                         self._best_train_area  = box_area
-                        self._best_train_frame = img.copy()
+                        self._best_train_frame = img_snapshot  # usa snapshot compartido
                         self._best_train_cls   = cls_name
                     try:
-                        self._ocr_queue.put_nowait((img.copy(), crop.copy(), bbox, conf, cls_name))
+                        # img_snapshot compartido — no se copia de nuevo
+                        self._ocr_queue.put_nowait((img_snapshot, crop.copy(), bbox, conf, cls_name))
                     except queue.Full:
                         pass
 
-                # Overlay
-                modo_str = "🌙 NOCHE" if _es_noche() else "☀ DIA"
-                cv2.putText(annotated, f"FPS: {self.fps:.1f} {modo_str}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                cv2.putText(annotated, datetime.now().strftime("%H:%M:%S"),
-                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                pg_color = (0, 255, 0) if _pg_connected else (0, 0, 255)
-                pg_text  = f"PG: {len(UNIDADES)} uds" if _pg_connected else "PG: DESCONECTADA"
-                cv2.putText(annotated, pg_text,
-                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, pg_color, 2)
-                with self._tracker_lock:
-                    if self.tracker.active:
-                        dur     = self.tracker.get_duration()
-                        n_votos = len(self._track_votes)
-                        cv2.putText(annotated,
-                            f"TRACK: {self.tracker.active['numero']} | {dur:.0f}s | {n_votos} lecturas",
-                            (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                # Overlay — solo si hay clientes
+                if hls_active:
+                    modo_str = "NOCHE" if _es_noche() else "DIA"
+                    cv2.putText(annotated, f"FPS: {self.fps:.1f} [{modo_str}]",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    cv2.putText(annotated, datetime.now().strftime("%H:%M:%S"),
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                    pg_color = (0, 255, 0) if _pg_connected else (0, 0, 255)
+                    pg_text  = f"PG: {len(UNIDADES)} uds" if _pg_connected else "PG: DESCONECTADA"
+                    cv2.putText(annotated, pg_text,
+                        (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, pg_color, 2)
+                    with self._tracker_lock:
+                        if self.tracker.active:
+                            dur     = self.tracker.get_duration()
+                            n_votos = len(self._track_votes)
+                            cv2.putText(annotated,
+                                f"TRACK: {self.tracker.active['numero']} | {dur:.0f}s | {n_votos} lecturas",
+                                (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
                 with self.lock: self.result = annotated
                 with hls_lock: hls_push_frame(annotated)
@@ -1045,8 +1042,9 @@ if __name__ == '__main__':
     print(f"[INFO] Servidor en http://{FLASK_HOST}:{FLASK_PORT}")
     print(f"[INFO] PostgreSQL: {'CONECTADA' if _pg_connected else 'DESCONECTADA'} — {len(UNIDADES)} unidades")
     print(f"[INFO] SQLite: solo guarda detecciones aprobadas por el validador")
-    print(f"[INFO] OCR: preprocesamiento adaptado dia/noche")
-    print(f"[INFO] bbox minimo: 50px (laterales habilitados)")
+    print(f"[INFO] OCR: modo dia/noche activo")
+    print(f"[INFO] HLS: latencia reducida (1s/segmento, 3 segmentos)")
+    print(f"[INFO] DIAG: tracker comentado — verificando lag de video")
     try:
         app.run(host=FLASK_HOST, port=FLASK_PORT, threaded=True, use_reloader=False)
     except KeyboardInterrupt:
