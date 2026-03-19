@@ -3,8 +3,8 @@ CISA - Modulo de alertas y notificaciones
 Flujo de validacion:
   1. Deteccion → enviar_a_validador() con botones OK/NO
   2. Validador presiona boton
-  3. OK → db_insert en SQLite + reenviar al grupo MONITOR JETSON + Swagger/JSON
-  4. NO → guardar en /revisar, descartar (NO se guarda en SQLite)
+  3. OK → db_insert SQLite + envia foto al grupo + borra frame del disco
+  4. NO → mueve frame limpio a /revisar + borra de FRAMES_DIR + NO toca SQLite
 """
 
 import json
@@ -97,6 +97,16 @@ def _responder_callback(callback_id, texto):
         print(f"[TELEGRAM ERROR callback] {e}")
 
 
+def _borrar_frame(frame_path):
+    """Borra el frame temporal del disco de forma segura."""
+    try:
+        if frame_path and os.path.exists(frame_path):
+            os.remove(frame_path)
+            print(f"[CLEANUP] Frame borrado: {os.path.basename(frame_path)}")
+    except Exception as e:
+        print(f"[CLEANUP ERROR] {e}")
+
+
 # ==============================================================================
 # VALIDACION
 # ==============================================================================
@@ -144,8 +154,8 @@ def enviar_a_validador(frame_path, numero, confianza, ts, estado, no_detectado=N
 def actualizar_pendiente(msg_id, numero_ganador, confianza_ganadora, estado_ganador, duracion):
     """
     Llamado desde pipe_stream._cerrar_track cuando el bus sale de camara.
-    Actualiza el pendiente con el numero ganador (multi-lectura) y la duracion real.
-    Si el validador ya respondio (no esta en _pendientes), no hace nada.
+    Actualiza numero ganador (multi-lectura) y duracion real.
+    Si el validador ya respondio, no hace nada.
     """
     if msg_id is None:
         return
@@ -192,14 +202,15 @@ def _procesar_callbacks():
                     datos = _pendientes.pop(msg_id, None)
 
                 if not datos:
-                    _responder_callback(cb_id, "Ya procesada")
+                    # Pendiente no encontrado — servicio reiniciado entre deteccion y validacion
+                    _responder_callback(cb_id, "\u26a0\ufe0f Deteccion expirada (servicio reiniciado)")
                     continue
 
                 if cb_data.startswith("ok:"):
                     _responder_callback(cb_id, f"\u2713 {datos['numero']} verificado")
                     _on_correcto(datos)
                 elif cb_data.startswith("no:"):
-                    _responder_callback(cb_id, f"\u2717 {datos['numero']} descartado")
+                    _responder_callback(cb_id, f"\u2717 {datos['numero']} descartado y guardado en revisar/")
                     _on_incorrecto(datos)
 
         except requests.exceptions.Timeout:
@@ -211,8 +222,10 @@ def _procesar_callbacks():
 
 def _on_correcto(datos):
     """
-    Validador confirmo.
-    UNICO lugar donde se inserta en SQLite.
+    Validador confirmo:
+    1. Inserta en SQLite
+    2. Envia foto limpia al grupo MONITOR JETSON
+    3. Borra frame del disco (ya esta en Telegram, no hace falta guardarlo)
     """
     numero     = datos["numero"]
     confianza  = datos["confianza"]
@@ -221,12 +234,11 @@ def _on_correcto(datos):
     frame_path = datos["frame_path"]
     no_det     = datos["no_detectado"]
     duracion   = datos.get("duracion", 0)
-    captura    = os.path.basename(frame_path) if frame_path else None
 
-    # Guardar en SQLite solo ahora
-    _db_insert(no_det, numero, confianza, captura, estado, duracion)
+    # 1. Guardar en SQLite — unico lugar donde se inserta
+    _db_insert(no_det, numero, confianza, None, estado, duracion)
 
-    # Enviar al grupo MONITOR JETSON
+    # 2. Enviar al grupo MONITOR JETSON
     caption = (
         f"\u2705 *Unidad VERIFICADA*\n"
         f"\U0001f522 Numero: `{numero}`\n"
@@ -238,21 +250,29 @@ def _on_correcto(datos):
     _enviar_foto(TG_CHAT_ID, frame_path, caption)
     print(f"[VERIFICADO] {numero} guardado en SQLite y enviado al grupo")
 
+    # 3. Borrar frame del disco — ya no se necesita
+    _borrar_frame(frame_path)
+
     # enviar_a_swagger(datos)
     print(f"[SWAGGER] {numero} listo para enviar (endpoint pendiente)")
 
 
 def _on_incorrecto(datos):
     """
-    Validador rechazo. NO se guarda en SQLite.
+    Validador rechazo:
+    1. Mueve frame limpio a /revisar
+    2. Borra frame de FRAMES_DIR
+    3. NO toca SQLite
     """
     numero     = datos["numero"]
     frame_path = datos["frame_path"]
 
-    if os.path.exists(frame_path):
+    if frame_path and os.path.exists(frame_path):
         dest = os.path.join(REVISAR_DIR, os.path.basename(frame_path))
         shutil.copy2(frame_path, dest)
         print(f"[RECHAZADO] {numero} movido a revisar/ — no guardado en SQLite")
+        # Borrar el original de FRAMES_DIR
+        _borrar_frame(frame_path)
     else:
         print(f"[RECHAZADO] {numero} frame no encontrado")
 
@@ -273,6 +293,7 @@ def enviar_a_swagger(datos):
 # ==============================================================================
 
 def alerta_unidad_detectada(frame_path, numero, confianza, ts):
+    """Fallback: envia directo al grupo sin validacion."""
     caption = (
         f"\U0001f68c *Unidad detectada*\n"
         f"\U0001f522 Numero: `{numero}`\n"
@@ -284,6 +305,7 @@ def alerta_unidad_detectada(frame_path, numero, confianza, ts):
 
 
 def alerta_unidad_desconocida(frame_path, numero, confianza, ts):
+    """Numero OCR desconocido — va directo al grupo."""
     caption = (
         f"\U0001f6ab *NUMERO DESCONOCIDO*\n"
         f"\U0001f522 OCR leyo: `{numero}`\n"

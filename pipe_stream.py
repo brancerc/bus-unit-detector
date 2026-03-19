@@ -6,8 +6,9 @@ Cambios:
   refactor: modelo 1 clase 'numero' — eliminados filtros lateral/trasero/delantero
   perf: bbox minimo 40px → 60px
   feat: multi-lectura durante tracking — acumula votos, actualiza pendiente al salir
-  feat: SQLite solo guarda detecciones aprobadas por validador (db_insert en alertas._on_correcto)
-  diag: imwrite de frame limpio comentado — verificar si era causa del lag en video
+  feat: SQLite solo guarda detecciones aprobadas por validador
+  feat: NEW guarda solo frame limpio sin bounding box — sin crop ni clean
+  diag: imwrite de frame clean en _cerrar_track comentado — verificando lag
 """
 
 import cv2
@@ -165,7 +166,7 @@ threading.Thread(target=_refresh_unidades_loop, daemon=True).start()
 
 # ==============================================================================
 # SQLite — solo esquema e inicializacion
-# El db_insert vive en alertas._on_correcto y se llama solo al aprobar
+# db_insert vive en alertas._on_correcto, se llama solo al aprobar
 # ==============================================================================
 
 def init_db():
@@ -368,11 +369,6 @@ def recuperar_ocr(leido):
     return None, None
 
 
-def _clean_dir_for_class(cls_name):
-    """Con modelo 1 clase 'numero', todos los frames limpios van a CLEAN_DIR."""
-    return CLEAN_DIR
-
-
 # ==============================================================================
 # Tesseract OCR
 # ==============================================================================
@@ -568,16 +564,12 @@ class VideoStream:
 
 class InferenceStream:
     """
-    Arquitectura desacoplada:
-    - Hilo principal: YOLO + video (siempre fluido)
-    - Hilo OCR: OCR pesado + validacion + tracker + alertas
-
-    Flujo SQLite:
-    - NEW: guarda frame/crop/clean, envia Telegram al validador, guarda msg_id
-    - TRACKING: acumula lecturas OCR como votos
-    - _cerrar_track: determina ganador, llama actualizar_pendiente(msg_id, ganador, duracion)
-    - _on_correcto (alertas.py): recibe datos finales y hace el db_insert
-    - _on_incorrecto (alertas.py): mueve a /revisar, sin db_insert
+    Flujo de archivos en disco:
+    - NEW: guarda UN solo frame limpio (sin bounding box) en FRAMES_DIR
+           No guarda crop ni clean.
+    - _on_correcto (alertas): inserta SQLite, envia a grupo, borra frame del disco
+    - _on_incorrecto (alertas): mueve frame a /revisar, borra de FRAMES_DIR
+    - En disco solo vive el frame temporalmente hasta que el validador responde.
     """
     def __init__(self, vs):
         self.lock = threading.Lock()
@@ -596,17 +588,14 @@ class InferenceStream:
         self._track_frame  = None
         self._track_msg_id = None
 
-        # Multi-lectura
         self._track_votes          = []
         self._track_numero_inicial = None
         self._track_no_detectado   = None
 
-        # Mejor frame para reentrenamiento
         self._best_train_area  = 0
         self._best_train_frame = None
         self._best_train_cls   = None
 
-        # Desconocidas con debounce
         self._pending_desc       = None
         self._pending_desc_timer = None
 
@@ -624,7 +613,6 @@ class InferenceStream:
             numero_inicial = self._track_numero_inicial
             msg_id         = self._track_msg_id
 
-        # Determinar ganador por votos
         winner_num    = numero_inicial or track['numero']
         winner_conf   = track['conf']
         winner_estado = track['estado']
@@ -643,7 +631,6 @@ class InferenceStream:
             else:
                 print(f"[MULTI-LECTURA] Ganador confirma: {w_num}")
 
-        # Notificar a alertas.py con numero final y duracion
         actualizar_pendiente(msg_id, winner_num, winner_conf, winner_estado, duracion)
 
         # COMENTADO TEMPORALMENTE — diagnostico de lag en video
@@ -654,7 +641,6 @@ class InferenceStream:
         #     cv2.imwrite(os.path.join(CLEAN_DIR, train_name), self._best_train_frame)
         #     print(f"[TRAIN] Guardado frame clean de {winner_num}")
 
-        # Resetear estado
         self._best_train_area  = 0
         self._best_train_frame = None
         self._best_train_cls   = None
@@ -706,28 +692,27 @@ class InferenceStream:
                 # -- DESCONOCIDO --
                 if numero_valido is None:
                     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    # Solo frame limpio en desconocidas, sin bounding box
                     desc_frame_name = f"{ts_str}_DESCONOCIDA_{numero_leido}.jpg"
                     desc_frame_path = os.path.join(DESCONOCIDAS_DIR, desc_frame_name)
-                    desc_frame_save = img.copy()
-                    cv2.putText(desc_frame_save, f"DESCONOCIDA: {numero_leido}",
-                        (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-                    cv2.imwrite(desc_frame_path, desc_frame_save)
-                    cv2.imwrite(os.path.join(DESCONOCIDAS_DIR,
-                        f"{ts_str}_DESCONOCIDA_{numero_leido}_crop.jpg"), crop)
-                    cv2.imwrite(os.path.join(CLEAN_DIR,
-                        f"{ts_str}_DESCONOCIDA_{numero_leido}_clean.jpg"), img)
+                    cv2.imwrite(desc_frame_path, img)
+
                     with state_lock:
                         STATE["descartadas"] += 1
                     print(f"[DESCONOCIDA] '{numero_leido}'")
+
                     if self._pending_desc_timer:
                         self._pending_desc_timer.cancel()
+
                     ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     self._pending_desc = (desc_frame_path, numero_leido, conf, ts_now)
+
                     def _enviar_si_no_cancelada(datos):
                         fp, num, cnf, ts = datos
                         print(f"[DESCONOCIDA -> Telegram] '{num}' sin correccion tras 4s")
                         alerta_unidad_desconocida(fp, num, cnf, ts)
                         self._pending_desc = None
+
                     self._pending_desc_timer = threading.Timer(
                         4.0, _enviar_si_no_cancelada, args=[self._pending_desc])
                     self._pending_desc_timer.daemon = True
@@ -758,17 +743,12 @@ class InferenceStream:
                 # -- NEW -> Bus nuevo --
                 ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+                # Frame LIMPIO — sin bounding box, sin texto anotado
+                # Es el unico archivo que se guarda temporalmente en disco
+                # hasta que el validador responda
                 frame_name = f"{ts_str}_{numero_valido}.jpg"
                 frame_path = os.path.join(FRAMES_DIR, frame_name)
-                frame_save = img.copy()
-                cv2.putText(frame_save, numero_valido,
-                    (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-                cv2.rectangle(frame_save, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.imwrite(frame_path, frame_save)
-                cv2.imwrite(os.path.join(CROPS_DIR,
-                    f"{ts_str}_{numero_valido}_crop.jpg"), crop)
-                cv2.imwrite(os.path.join(CLEAN_DIR,
-                    f"{ts_str}_{numero_valido}_clean.jpg"), img)
+                cv2.imwrite(frame_path, img)
 
                 self._track_ts    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self._track_frame = frame_name
@@ -992,8 +972,7 @@ if __name__ == '__main__':
     print(f"[INFO] Servidor en http://{FLASK_HOST}:{FLASK_PORT}")
     print(f"[INFO] PostgreSQL: {'CONECTADA' if _pg_connected else 'DESCONECTADA'} — {len(UNIDADES)} unidades")
     print(f"[INFO] SQLite: solo guarda detecciones aprobadas por el validador")
-    print(f"[INFO] Multi-lectura: acumula votos, actualiza pendiente al salir")
-    print(f"[INFO] DIAG: imwrite de frame clean comentado — verificando lag")
+    print(f"[INFO] Frames: solo frame limpio temporal, se borra tras validacion")
     try:
         app.run(host=FLASK_HOST, port=FLASK_PORT, threaded=True, use_reloader=False)
     except KeyboardInterrupt:
