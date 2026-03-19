@@ -2,22 +2,17 @@
 CISA - Sistema de Deteccion y Monitoreo de Unidades de Transporte
 Pipeline: RTSP -> GStreamer -> YOLO -> OCR -> Validacion PG -> Tracking -> Alertas
 
-Cambios:
-  refactor: modelo 1 clase 'numero'
-  perf: bbox 50px para capturar laterales
-  feat: multi-lectura durante tracking
-  feat: SQLite solo guarda detecciones aprobadas por validador
-  feat: frame limpio sin bounding box
-  fix: correccion de trasposiciones y digitos duplicados en validar_numero
-  fix: preprocesamiento OCR nocturno mas agresivo (22:00-06:00)
-  fix: N_VOTOS aumentado de noche
-  perf: img.copy() una sola vez por frame (no por cada caja detectada)
-  perf: _cerrar_track movido a hilo separado — no bloquea el video
-  perf: results[0].plot() solo cuando hay clientes HLS activos
-  perf: cv2.imwrite de NEW en hilo separado — no bloquea el OCR worker
-  perf: HLS hls_time=1s, hls_list_size=3 — menor latencia en navegador
-  diag: tracker check_gone + _cerrar_track comentados — diagnostico de lag
-  diag: imwrite de frame clean en _cerrar_track comentado
+Arquitectura de hilos:
+  Hilo 1: VideoStream         — captura frames de GStreamer
+  Hilo 2: HLSStream           — empuja frames a ffmpeg (25 FPS, NUNCA bloqueado)
+  Hilo 3: InferenceStream     — YOLO + encolar crops (a su propio ritmo)
+  Hilo 4: _ocr_worker         — OCR pesado + validacion + alertas
+  Hilo 5: _refresh_unidades   — refresco PostgreSQL
+  Hilo 6: hls_watchdog        — mata ffmpeg si no hay clientes
+
+Separar HLS de YOLO es el cambio clave:
+  ANTES: mismo loop → YOLO lento = video lento
+  AHORA: HLS corre a 25 FPS independiente, YOLO a su propio ritmo (~10-15 FPS)
 """
 
 import cv2
@@ -174,7 +169,7 @@ threading.Thread(target=_refresh_unidades_loop, daemon=True).start()
 
 
 # ==============================================================================
-# SQLite — solo esquema e inicializacion
+# SQLite
 # ==============================================================================
 
 def init_db():
@@ -205,11 +200,11 @@ def init_db():
                 FROM detecciones
             """)
             con.commit()
-            print(f"[DB] Migrados {old_count} registros de 'detecciones' a 'evento_paso'.")
+            print(f"[DB] Migrados {old_count} registros.")
     except sqlite3.OperationalError:
         pass
     con.commit(); con.close()
-    print("[DB] SQLite lista (esquema evento_paso).")
+    print("[DB] SQLite lista.")
 
 
 def db_query(fecha=None, limit=50):
@@ -278,7 +273,7 @@ def _corregir_digito_duplicado(leido, unidades_4d5):
             if len(sin_dup) == 3:
                 candidato = sin_dup[0] + '0' + sin_dup[1:]
                 if candidato in unidades_4d5:
-                    print(f"[CORREGIDO] '{leido}' -> '{candidato}' (digito duplicado pos {i})")
+                    print(f"[CORREGIDO] '{leido}' -> '{candidato}' (digito duplicado)")
                     return candidato, "CORREGIDO"
     return None, None
 
@@ -288,91 +283,72 @@ def validar_numero(leido):
     with _unidades_lock:
         unidades_snapshot = UNIDADES.copy()
     if not unidades_snapshot:
-        print(f"[DESCARTADO] '{leido}' — lista PG vacia")
         return None, None
 
     unidades_4d5 = {u for u in unidades_snapshot if len(u) == 4 and u.startswith('5')}
 
     if len(leido) == 4 and leido.startswith('5'):
         if leido in unidades_4d5:
-            print(f"[VERIFICADO] '{leido}' existe en PostgreSQL")
             return leido, "VERIFICADO"
         mejor, mejor_dist = None, 999
         for u in unidades_4d5:
             d = levenshtein(leido, u)
             if d < mejor_dist: mejor_dist = d; mejor = u
         if mejor_dist <= LEVENSHTEIN_MAX:
-            print(f"[CORREGIDO] '{leido}' -> '{mejor}' (Lev={mejor_dist})")
             return mejor, "CORREGIDO"
         r, e = _corregir_trasposicion(leido, unidades_4d5)
         if r: return r, e
         r, e = _corregir_digito_duplicado(leido, unidades_4d5)
         if r: return r, e
-        print(f"[DESCARTADO] '{leido}' sin match 4dig (mejor: {mejor}, dist={mejor_dist})")
         return None, None
 
     if len(leido) == 3 and leido[0] == '5':
         if leido in unidades_snapshot:
-            print(f"[VERIFICADO] '{leido}' existe como 3-dig en PG")
             return leido, "VERIFICADO"
         candidato_4d = leido[0] + '0' + leido[1:]
         if candidato_4d in unidades_4d5:
-            print(f"[CORREGIDO] OCR '{leido}' -> '{candidato_4d}' (insertar 0)")
             return candidato_4d, "CORREGIDO"
         mejor, mejor_dist = None, 999
         for u in unidades_4d5:
             d = levenshtein(candidato_4d, u)
             if d < mejor_dist: mejor_dist = d; mejor = u
         if mejor_dist <= LEVENSHTEIN_MAX:
-            print(f"[CORREGIDO] OCR '{leido}' -> '{candidato_4d}' -> '{mejor}' (Lev={mejor_dist})")
             return mejor, "CORREGIDO"
-        print(f"[DESCARTADO] '{leido}' sin match 3dig ni 4dig")
         return None, None
 
     if len(leido) == 4 and leido[0] != '5':
         normalizado = '5' + leido[1:]
         if normalizado in unidades_4d5:
-            print(f"[CORREGIDO] '{leido}' -> '{normalizado}'")
             return normalizado, "CORREGIDO"
         mejor, mejor_dist = None, 999
         for u in unidades_4d5:
             d = levenshtein(normalizado, u)
             if d < mejor_dist: mejor_dist = d; mejor = u
         if mejor_dist <= LEVENSHTEIN_MAX:
-            print(f"[CORREGIDO] '{leido}' -> '{normalizado}' -> '{mejor}' (Lev={mejor_dist})")
             return mejor, "CORREGIDO"
         r, e = _corregir_trasposicion(normalizado, unidades_4d5)
         if r: return r, e
-        print(f"[DESCARTADO] '{leido}' -> '{normalizado}' sin match")
         return None, None
 
     if len(leido) == 3 and leido[0] != '5':
         candidato = '5' + leido
         if candidato in unidades_4d5:
-            print(f"[CORREGIDO] OCR '{leido}' -> '{candidato}' (anteponer 5)")
             return candidato, "CORREGIDO"
         mejor, mejor_dist = None, 999
         for u in unidades_4d5:
             d = levenshtein(candidato, u)
             if d < mejor_dist: mejor_dist = d; mejor = u
         if mejor_dist <= LEVENSHTEIN_MAX:
-            print(f"[CORREGIDO] OCR '{leido}' -> '{candidato}' -> '{mejor}' (Lev={mejor_dist})")
             return mejor, "CORREGIDO"
         candidato_50 = '50' + leido[1:]
         if candidato_50 in unidades_4d5:
-            print(f"[CORREGIDO] OCR '{leido}' -> '{candidato_50}' (forzar 50xx)")
             return candidato_50, "CORREGIDO"
         if leido in unidades_snapshot:
-            print(f"[VERIFICADO] '{leido}' existe como 3-dig en PG")
             return leido, "VERIFICADO"
-        print(f"[DESCARTADO] '{leido}' -> '{candidato}' sin match")
         return None, None
 
     if leido in unidades_snapshot:
-        print(f"[VERIFICADO] '{leido}' existe en PG")
         return leido, "VERIFICADO"
-
-    print(f"[DESCARTADO] '{leido}' formato no reconocido")
     return None, None
 
 
@@ -395,11 +371,9 @@ def recuperar_ocr(leido):
     if normalizado[1] != '0':
         candidato = '50' + normalizado[2:]
         if candidato in unidades_4d5:
-            print(f"[RECUPERADO] '{leido}' -> forzar 50xx -> '{candidato}'")
             return candidato, "CORREGIDO"
         for u in unidades_4d5:
             if levenshtein(candidato, u) <= LEVENSHTEIN_MAX:
-                print(f"[RECUPERADO] '{leido}' -> 50{normalizado[2:]} ~ '{u}' (Lev)")
                 return u, "CORREGIDO"
     return None, None
 
@@ -471,22 +445,39 @@ print("[INFO] Cargando modelo TensorRT...")
 model = YOLO(MODEL_PATH, task="detect")
 print("[INFO] Modelo cargado.")
 
+# Frame anotado compartido entre HLS e inferencia
+# HLS siempre tiene el ultimo frame disponible (crudo o anotado)
+_latest_frame      = None
+_latest_frame_lock = threading.Lock()
+
+
+def set_latest_frame(frame):
+    global _latest_frame
+    with _latest_frame_lock:
+        _latest_frame = frame
+
+
+def get_latest_frame():
+    with _latest_frame_lock:
+        return _latest_frame
+
 
 # ==============================================================================
 # Estado global
 # ==============================================================================
 STATE = {
     "numero": None, "conf": None, "ts": None,
-    "fps": 0.0, "pipeline": False, "total_detecciones": 0,
-    "unidades_registradas": 0, "pg_conectada": False,
-    "descartadas": 0, "tracking": None, "tracking_duracion": 0,
+    "fps": 0.0, "yolo_fps": 0.0, "pipeline": False,
+    "total_detecciones": 0, "unidades_registradas": 0,
+    "pg_conectada": False, "descartadas": 0,
+    "tracking": None, "tracking_duracion": 0,
 }
 state_lock = threading.Lock()
 
 
 # ==============================================================================
 # HLS bajo demanda
-# [perf] hls_time=1s y hls_list_size=3 — menor latencia en navegador
+# Hilo independiente — empuja frames a 25 FPS sin importar cuanto tarda YOLO
 # ==============================================================================
 hls_lock      = threading.Lock()
 hls_last_ping = 0
@@ -508,8 +499,8 @@ def hls_start():
         '-s', f'{w}x{h}', '-pix_fmt', 'bgr24', '-r', str(HLS_FPS), '-i', '-',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
         '-f', 'hls',
-        '-hls_time', '1',           # [perf] segmentos de 1s (antes 2s)
-        '-hls_list_size', '3',      # [perf] solo 3 segmentos en playlist (antes 10)
+        '-hls_time', '1',
+        '-hls_list_size', '3',
         '-hls_flags', 'delete_segments+append_list',
         '-hls_segment_type', 'mpegts',
         '-hls_segment_filename', f'{HLS_DIR}/seg%03d.ts',
@@ -543,17 +534,32 @@ def hls_watchdog():
 threading.Thread(target=hls_watchdog, daemon=True).start()
 
 
-def hls_push_frame(frame):
-    global hls_proc, hls_active
-    if not hls_active or hls_proc is None:
-        return
-    try:
-        resized = cv2.resize(frame, HLS_RESOLUTION)
-        hls_proc.stdin.write(resized.tobytes())
-    except BrokenPipeError:
-        hls_stop()
-    except Exception:
-        pass
+def hls_push_loop():
+    """
+    Hilo dedicado al HLS — completamente independiente de YOLO.
+    Toma el ultimo frame disponible y lo empuja a ffmpeg a HLS_FPS.
+    Si YOLO es lento, repite el mismo frame — el video nunca se congela.
+    """
+    interval = 1.0 / HLS_FPS
+    while True:
+        t0 = time.time()
+        if hls_active and hls_proc is not None:
+            frame = get_latest_frame()
+            if frame is not None:
+                try:
+                    resized = cv2.resize(frame, HLS_RESOLUTION)
+                    hls_proc.stdin.write(resized.tobytes())
+                except BrokenPipeError:
+                    with hls_lock:
+                        hls_stop()
+                except Exception:
+                    pass
+        elapsed = time.time() - t0
+        sleep_t = interval - elapsed
+        if sleep_t > 0:
+            time.sleep(sleep_t)
+
+threading.Thread(target=hls_push_loop, daemon=True).start()
 
 
 # ==============================================================================
@@ -592,6 +598,9 @@ class VideoStream:
             if ret:
                 with state_lock: STATE["pipeline"] = True
                 with self.lock: self.frame = frame
+                # Publicar frame crudo inmediatamente para HLS
+                # YOLO lo sobreescribira con cajas cuando termine
+                set_latest_frame(frame)
             else:
                 with state_lock: STATE["pipeline"] = False
                 time.sleep(5); self._abrir_pipeline()
@@ -606,16 +615,15 @@ class VideoStream:
 
 
 # ==============================================================================
-# Hilo 2: Inferencia + OCR + Tracking
+# Hilo 2: Inferencia YOLO + OCR
+# Corre a su propio ritmo sin bloquear el HLS
 # ==============================================================================
 
 class InferenceStream:
     def __init__(self, vs):
-        self.lock = threading.Lock()
-        self.result = None
         self.running = True
         self.vs = vs
-        self.fps = 0.0
+        self.yolo_fps = 0.0
         self._cnt = 0
         self._t = time.time()
 
@@ -642,15 +650,9 @@ class InferenceStream:
         print("[INFO] Hilo OCR separado iniciado.")
 
     def _cerrar_track(self, track, duracion):
-        """
-        Corre en hilo separado — no bloquea el video.
-        [diag] Tracker comentado — verificando si era causa del lag
-        """
         if not track or not self._track_ts:
             return
-
         print(f"[TRACK FIN] {track['numero']} | Duracion: {duracion}s")
-
         with self._tracker_lock:
             votes          = self._track_votes.copy()
             numero_inicial = self._track_numero_inicial
@@ -669,19 +671,8 @@ class InferenceStream:
             winner_num    = w_num
             winner_conf   = max(c for c, e in winner_entries)
             winner_estado = winner_entries[0][1]
-            if w_num != numero_inicial:
-                print(f"[MULTI-LECTURA] Corrigiendo {numero_inicial} → {w_num}")
-            else:
-                print(f"[MULTI-LECTURA] Ganador confirma: {w_num}")
 
         actualizar_pendiente(msg_id, winner_num, winner_conf, winner_estado, duracion)
-
-        # COMENTADO — diagnostico de lag
-        # if self._best_train_frame is not None:
-        #     ts_train   = datetime.now().strftime("%Y%m%d_%H%M%S")
-        #     train_name = f"{ts_train}_{winner_num}_clean.jpg"
-        #     cv2.imwrite(os.path.join(CLEAN_DIR, train_name), self._best_train_frame)
-        #     print(f"[TRAIN] Guardado frame clean de {winner_num}")
 
         self._best_train_area  = 0
         self._best_train_frame = None
@@ -733,40 +724,34 @@ class InferenceStream:
                 if numero_valido is None:
                     numero_valido, estado = recuperar_ocr(numero_leido)
 
-                # -- DESCONOCIDO --
                 if numero_valido is None:
                     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    desc_frame_path = os.path.join(DESCONOCIDAS_DIR,
+                    desc_path = os.path.join(DESCONOCIDAS_DIR,
                         f"{ts_str}_DESCONOCIDA_{numero_leido}.jpg")
-                    # [perf] imwrite en hilo separado
-                    threading.Thread(
-                        target=cv2.imwrite,
-                        args=(desc_frame_path, img.copy()),
-                        daemon=True).start()
+                    threading.Thread(target=cv2.imwrite,
+                        args=(desc_path, img.copy()), daemon=True).start()
                     with state_lock:
                         STATE["descartadas"] += 1
                     print(f"[DESCONOCIDA] '{numero_leido}'")
                     if self._pending_desc_timer:
                         self._pending_desc_timer.cancel()
                     ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    self._pending_desc = (desc_frame_path, numero_leido, conf, ts_now)
-                    def _enviar_si_no_cancelada(datos):
+                    self._pending_desc = (desc_path, numero_leido, conf, ts_now)
+                    def _enviar_desc(datos):
                         fp, num, cnf, ts = datos
-                        print(f"[DESCONOCIDA -> Telegram] '{num}' sin correccion tras 4s")
                         alerta_unidad_desconocida(fp, num, cnf, ts)
                         self._pending_desc = None
                     self._pending_desc_timer = threading.Timer(
-                        4.0, _enviar_si_no_cancelada, args=[self._pending_desc])
+                        4.0, _enviar_desc, args=[self._pending_desc])
                     self._pending_desc_timer.daemon = True
                     self._pending_desc_timer.start()
                     continue
 
-                # -- NUMERO VALIDO -> TRACKER --
                 if self._pending_desc_timer:
                     self._pending_desc_timer.cancel()
                     self._pending_desc_timer = None
                     if self._pending_desc:
-                        print(f"[DEBOUNCE] Cancelada DESCONOCIDA '{self._pending_desc[1]}' -> {numero_valido}")
+                        print(f"[DEBOUNCE] Cancelada DESCONOCIDA -> {numero_valido}")
                         self._pending_desc = None
 
                 with self._tracker_lock:
@@ -781,17 +766,13 @@ class InferenceStream:
                         print(f"[MULTI-LECTURA] {n_acum} lecturas | tracker: {active}")
                     continue
 
-                # -- NEW --
+                # NEW
                 ts_str     = datetime.now().strftime("%Y%m%d_%H%M%S")
                 frame_name = f"{ts_str}_{numero_valido}.jpg"
                 frame_path = os.path.join(FRAMES_DIR, frame_name)
-
-                # [perf] imwrite en hilo separado — no bloquea el OCR worker
-                img_save = img.copy()
-                threading.Thread(
-                    target=cv2.imwrite,
-                    args=(frame_path, img_save),
-                    daemon=True).start()
+                img_save   = img.copy()
+                threading.Thread(target=cv2.imwrite,
+                    args=(frame_path, img_save), daemon=True).start()
 
                 self._track_ts    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self._track_frame = frame_name
@@ -810,14 +791,12 @@ class InferenceStream:
                     STATE["tracking"] = numero_valido
                     STATE["tracking_duracion"] = 0
 
-                modo = "NOCHE" if _es_noche() else "DIA"
-                print(f"[NEW {estado}] {numero_valido} | Conf: {conf:.2f} | {modo} | TRACKING iniciado")
+                print(f"[NEW {estado}] {numero_valido} | Conf: {conf:.2f} | TRACKING iniciado")
 
                 ts_now = self._track_ts
                 msg_id = enviar_a_validador(
                     frame_path, numero_valido, conf, ts_now, estado,
-                    no_detectado=numero_leido
-                )
+                    no_detectado=numero_leido)
                 with self._tracker_lock:
                     self._track_msg_id = msg_id
 
@@ -826,10 +805,9 @@ class InferenceStream:
 
     def update(self):
         """
-        Hilo principal de inferencia.
-        [perf] img.copy() una sola vez por frame antes del loop de cajas
-        [perf] results[0].plot() solo cuando hay clientes HLS activos
-        [diag] tracker check_gone + _cerrar_track comentados — verificando lag
+        Hilo YOLO — corre a su propio ritmo.
+        Publica el frame anotado en _latest_frame para que HLS lo tome.
+        El HLS NO espera este hilo — si YOLO es lento, HLS repite el ultimo frame.
         """
         while self.running:
             img = self.vs.get_frame()
@@ -838,44 +816,33 @@ class InferenceStream:
             try:
                 results = model.predict(img, conf=MODEL_CONF, device=0, verbose=False)
 
-                # [perf] Solo dibujar cajas si hay alguien viendo el stream
-                # Ahorra CPU cuando no hay clientes conectados
-                if hls_active:
-                    annotated = results[0].plot()
-                else:
-                    annotated = img
-
                 self._cnt += 1
                 elapsed = time.time() - self._t
                 if elapsed >= 1.0:
-                    self.fps = self._cnt / elapsed
+                    self.yolo_fps = self._cnt / elapsed
                     self._cnt = 0; self._t = time.time()
                     with state_lock:
-                        STATE["fps"] = round(self.fps, 1)
-                        STATE["pg_conectada"] = _pg_connected
+                        STATE["yolo_fps"]            = round(self.yolo_fps, 1)
+                        STATE["pg_conectada"]        = _pg_connected
                         with _unidades_lock:
                             STATE["unidades_registradas"] = len(UNIDADES)
 
-                # [diag] TRACKER COMENTADO — verificando si causa lag
-                # Si el video mejora sin esto, el tracker se mueve a hilo separado
-                # with self._tracker_lock:
-                #     gone_track, gone_dur = self.tracker.check_gone()
-                # if gone_track:
-                #     threading.Thread(
-                #         target=self._cerrar_track,
-                #         args=(gone_track, gone_dur),
-                #         daemon=True).start()
+                # Tracker
+                with self._tracker_lock:
+                    gone_track, gone_dur = self.tracker.check_gone()
+                if gone_track:
+                    threading.Thread(
+                        target=self._cerrar_track,
+                        args=(gone_track, gone_dur),
+                        daemon=True).start()
 
-                # Actualizar duracion en STATE
                 with self._tracker_lock:
                     if self.tracker.active:
                         with state_lock:
                             STATE["tracking"]          = self.tracker.active['numero']
                             STATE["tracking_duracion"] = self.tracker.get_duration()
 
-                # [perf] UNA SOLA copia del frame antes del loop
-                # Antes: img.copy() por cada caja = N copias por frame
-                # Ahora: una copia compartida para todas las cajas
+                # UNA sola copia del frame para todas las cajas
                 img_snapshot = img.copy()
 
                 for box in results[0].boxes:
@@ -897,46 +864,41 @@ class InferenceStream:
                     box_area = box_w * box_h
                     if box_area > self._best_train_area:
                         self._best_train_area  = box_area
-                        self._best_train_frame = img_snapshot  # usa snapshot compartido
+                        self._best_train_frame = img_snapshot
                         self._best_train_cls   = cls_name
                     try:
-                        # img_snapshot compartido — no se copia de nuevo
-                        self._ocr_queue.put_nowait((img_snapshot, crop.copy(), bbox, conf, cls_name))
+                        self._ocr_queue.put_nowait(
+                            (img_snapshot, crop.copy(), bbox, conf, cls_name))
                     except queue.Full:
                         pass
 
-                # Overlay — solo si hay clientes
-                if hls_active:
-                    modo_str = "NOCHE" if _es_noche() else "DIA"
-                    cv2.putText(annotated, f"FPS: {self.fps:.1f} [{modo_str}]",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                    cv2.putText(annotated, datetime.now().strftime("%H:%M:%S"),
-                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                    pg_color = (0, 255, 0) if _pg_connected else (0, 0, 255)
-                    pg_text  = f"PG: {len(UNIDADES)} uds" if _pg_connected else "PG: DESCONECTADA"
-                    cv2.putText(annotated, pg_text,
-                        (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, pg_color, 2)
-                    with self._tracker_lock:
-                        if self.tracker.active:
-                            dur     = self.tracker.get_duration()
-                            n_votos = len(self._track_votes)
-                            cv2.putText(annotated,
-                                f"TRACK: {self.tracker.active['numero']} | {dur:.0f}s | {n_votos} lecturas",
-                                (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                # Dibujar overlay y publicar para HLS
+                annotated = results[0].plot()
+                modo_str = "NOCHE" if _es_noche() else "DIA"
+                cv2.putText(annotated, f"YOLO: {self.yolo_fps:.1f}fps [{modo_str}]",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.putText(annotated, datetime.now().strftime("%H:%M:%S"),
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                pg_color = (0, 255, 0) if _pg_connected else (0, 0, 255)
+                pg_text  = f"PG: {len(UNIDADES)} uds" if _pg_connected else "PG: DESCONECTADA"
+                cv2.putText(annotated, pg_text,
+                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, pg_color, 2)
+                with self._tracker_lock:
+                    if self.tracker.active:
+                        dur     = self.tracker.get_duration()
+                        n_votos = len(self._track_votes)
+                        cv2.putText(annotated,
+                            f"TRACK: {self.tracker.active['numero']} | {dur:.0f}s | {n_votos} lecturas",
+                            (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-                with self.lock: self.result = annotated
-                with hls_lock: hls_push_frame(annotated)
+                # Publicar frame anotado — HLS lo tomara en su proximo ciclo
+                set_latest_frame(annotated)
 
             except Exception as e:
                 print(f"[ERROR] Inferencia: {e}"); time.sleep(0.1)
 
-    def get_result(self):
-        with self.lock:
-            return self.result.copy() if self.result is not None else None
-
     def stop(self):
         self.running = False
-        if self.cap: self.cap.release()
 
 
 # ==============================================================================
@@ -947,7 +909,9 @@ inference = InferenceStream(stream)
 
 threading.Thread(target=stream.update,    daemon=True).start()
 threading.Thread(target=inference.update, daemon=True).start()
-print("[INFO] Hilos iniciados. HLS arrancara solo cuando abras /livevideo")
+print("[INFO] Hilos iniciados.")
+print("[INFO] HLS corre a 25 FPS independiente de YOLO")
+print("[INFO] HLS arrancara solo cuando abras /livevideo")
 
 
 # ==============================================================================
@@ -1026,11 +990,14 @@ def api_unidades():
 def health():
     with state_lock:
         return jsonify({
-            "status": "ok", "fps": STATE["fps"],
-            "pipeline": STATE["pipeline"], "hls": hls_active,
-            "pg_conectada": _pg_connected, "unidades_pg": len(UNIDADES),
-            "descartadas": STATE["descartadas"],
-            "tracking": STATE["tracking"],
+            "status":            "ok",
+            "yolo_fps":          STATE["yolo_fps"],
+            "pipeline":          STATE["pipeline"],
+            "hls":               hls_active,
+            "pg_conectada":      _pg_connected,
+            "unidades_pg":       len(UNIDADES),
+            "descartadas":       STATE["descartadas"],
+            "tracking":          STATE["tracking"],
             "tracking_duracion": STATE["tracking_duracion"]
         })
 
@@ -1041,10 +1008,7 @@ def health():
 if __name__ == '__main__':
     print(f"[INFO] Servidor en http://{FLASK_HOST}:{FLASK_PORT}")
     print(f"[INFO] PostgreSQL: {'CONECTADA' if _pg_connected else 'DESCONECTADA'} — {len(UNIDADES)} unidades")
-    print(f"[INFO] SQLite: solo guarda detecciones aprobadas por el validador")
-    print(f"[INFO] OCR: modo dia/noche activo")
-    print(f"[INFO] HLS: latencia reducida (1s/segmento, 3 segmentos)")
-    print(f"[INFO] DIAG: tracker comentado — verificando lag de video")
+    print(f"[INFO] Arquitectura: HLS independiente de YOLO")
     try:
         app.run(host=FLASK_HOST, port=FLASK_PORT, threaded=True, use_reloader=False)
     except KeyboardInterrupt:
