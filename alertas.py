@@ -1,10 +1,12 @@
 """
 CISA - Módulo de alertas y notificaciones
 Flujo de validación:
-  1. Detección → enviar_a_validador() con botones ✓/✗
-  2. Validador presiona botón (frame permanece en el chat de Telegram hasta entonces)
-  3. ✓ Correcto  → INSERT SQLite + foto al grupo MONITOR JETSON + borra frame del disco
-  4. ✗ Incorrecto → mueve frame a /revisar/. NO guarda en SQLite.
+  1. Detección conocida  → enviar_a_validador() con botones ✓/✗
+  2. Detección desconocida → enviar al VALIDADOR (no al grupo) con botones 📢/🗑
+     ✓ Correcto   → INSERT SQLite + foto al grupo MONITOR JETSON + borra frame
+     ✗ Incorrecto → mueve frame a /revisar/. NO guarda en SQLite.
+     📢 Enviar    → reenvía desconocida al grupo
+     🗑 Ignorar   → borra frame, no hace nada más
 """
 
 import json
@@ -22,23 +24,21 @@ from config import (
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
-_pendientes      = {}
+_pendientes      = {}   # Detecciones conocidas pendientes de validar
+_pendientes_desc = {}   # Detecciones desconocidas pendientes de confirmar
 _pendientes_lock = threading.Lock()
 _update_offset   = 0
 
-# Callback opcional registrado por pipe_stream para actualizar tiles en tiempo real.
-# Firma: fn(msg_id: int, nuevo_estado: str) → None
 _on_validated_callback = None
 
 
 def set_validation_callback(fn):
-    """pipe_stream_v2 llama esto al arrancar para recibir confirmaciones/rechazos."""
     global _on_validated_callback
     _on_validated_callback = fn
 
 
 # ==============================================================================
-# SQLite — solo cuando el validador aprueba
+# SQLite
 # ==============================================================================
 
 def _db_insert(no_detectado, no_economico, confianza, captura_url=None,
@@ -107,27 +107,26 @@ def _borrar_frame(frame_path):
     try:
         if frame_path and os.path.exists(frame_path):
             os.remove(frame_path)
-            print(f"[CLEANUP] Frame borrado: {os.path.basename(frame_path)}")
+            print(f"[CLEANUP] Borrado: {os.path.basename(frame_path)}")
     except Exception as e:
         print(f"[CLEANUP ERROR] {e}")
 
 
 def _mover_a_revisar(frame_path):
-    """Mueve el frame rechazado a /revisar/ para revisión posterior."""
     try:
         if frame_path and os.path.exists(frame_path):
             dest = os.path.join(REVISAR_DIR, os.path.basename(frame_path))
             shutil.move(frame_path, dest)
-            print(f"[REVISAR] Frame movido: {os.path.basename(frame_path)}")
+            print(f"[REVISAR] Movido: {os.path.basename(frame_path)}")
     except Exception as e:
         print(f"[REVISAR ERROR] {e}")
 
 
 # ==============================================================================
-# Validación
+# Validación — detecciones CONOCIDAS
 # ==============================================================================
 
-def enviar_a_validador(frame_path, numero, confianza, ts, estado, no_detectado=None):
+def enviar_a_validador(frame_path, numero, confianza, ts, estado, no_detectado=None, thumb_name=None):
     caption = (
         f"\U0001f50d *Validar detección*\n"
         f"\U0001f522 Número: `{numero}`\n"
@@ -151,17 +150,18 @@ def enviar_a_validador(frame_path, numero, confianza, ts, estado, no_detectado=N
                 "estado":       estado,
                 "frame_path":   frame_path,
                 "duracion":     0,
+                "thumb_name":   thumb_name,  # <--- NUEVO
             }
-        print(f"[VALIDADOR] Enviado {numero} (msg_id={msg_id}) — esperando respuesta")
+        print(f"[VALIDADOR] {numero} enviado (msg_id={msg_id})")
         return msg_id
-    # Fallback: enviar directo al grupo sin validación
     print(f"[VALIDADOR] Fallo envío → fallback al grupo")
     alerta_unidad_detectada(frame_path, numero, confianza, ts)
     return None
 
 
+
+
 def actualizar_pendiente(msg_id, numero_ganador, confianza_ganadora, estado_ganador, duracion):
-    """Actualiza el pendiente con el número ganador por multi-lectura al salir el bus."""
     if msg_id is None:
         return
     with _pendientes_lock:
@@ -172,13 +172,45 @@ def actualizar_pendiente(msg_id, numero_ganador, confianza_ganadora, estado_gana
                 "estado":    estado_ganador,
                 "duracion":  duracion,
             })
-            print(f"[VALIDADOR] Pendiente {msg_id} → {numero_ganador} | dur: {duracion}s")
+            print(f"[VALIDADOR] {msg_id} actualizado → {numero_ganador} | {duracion}s")
         else:
-            print(f"[VALIDADOR] Pendiente {msg_id} ya procesado antes de que saliera el bus")
+            print(f"[VALIDADOR] {msg_id} ya procesado antes de que saliera el bus")
 
 
 # ==============================================================================
-# Listener de callbacks
+# Alertas directas — detecciones DESCONOCIDAS
+# ==============================================================================
+
+def alerta_unidad_desconocida(frame_path, numero, confianza, ts):
+    """
+    Manda al VALIDADOR (no al grupo) con botones para confirmar o ignorar.
+    Evita que OCR basura llegue al chat de monitoreo.
+    """
+    caption = (
+        f"\U0001f50d *¿Número desconocido?*\n"
+        f"\U0001f522 OCR leyó: `{numero}`\n"
+        f"\U0001f4ca Confianza YOLO: `{round(confianza * 100)}%`\n"
+        f"\U0001f550 Hora: `{ts}`\n\n"
+        f"_¿Es una unidad real no registrada?_"
+    )
+    keyboard = json.dumps({"inline_keyboard": [[
+        {"text": "📢 Sí, enviar al grupo", "callback_data": f"desc_ok:{numero}"},
+        {"text": "🗑 No, ignorar",          "callback_data": f"desc_no:{numero}"},
+    ]]})
+    msg_id = _enviar_foto(TG_VALIDADOR_ID, frame_path, caption, reply_markup=keyboard)
+    if msg_id:
+        with _pendientes_lock:
+            _pendientes_desc[msg_id] = {
+                "numero":    numero,
+                "confianza": confianza,
+                "ts":        ts,
+                "frame_path": frame_path,
+            }
+    print(f"[DESCONOCIDA] '{numero}' → validador (no al grupo)")
+
+
+# ==============================================================================
+# Listener de callbacks Telegram
 # ==============================================================================
 
 def _procesar_callbacks():
@@ -205,19 +237,34 @@ def _procesar_callbacks():
                     _responder_callback(cb_id, "No autorizado")
                     continue
 
-                with _pendientes_lock:
-                    datos = _pendientes.pop(msg_id, None)
+                # ── Detección conocida ─────────────────────────────────────
+                if cb_data.startswith("ok:") or cb_data.startswith("no:"):
+                    with _pendientes_lock:
+                        datos = _pendientes.pop(msg_id, None)
+                    if not datos:
+                        _responder_callback(cb_id, "⚠️ Detección expirada")
+                        continue
+                    if cb_data.startswith("ok:"):
+                        _responder_callback(cb_id, f"✓ {datos['numero']} verificado")
+                        _on_correcto(msg_id, datos)
+                    else:
+                        _responder_callback(cb_id, f"✗ {datos['numero']} descartado")
+                        _on_incorrecto(msg_id, datos)
 
-                if not datos:
-                    _responder_callback(cb_id, "⚠️ Detección expirada (servicio reiniciado)")
-                    continue
-
-                if cb_data.startswith("ok:"):
-                    _responder_callback(cb_id, f"✓ {datos['numero']} verificado")
-                    _on_correcto(msg_id, datos)
-                elif cb_data.startswith("no:"):
-                    _responder_callback(cb_id, f"✗ {datos['numero']} descartado")
-                    _on_incorrecto(msg_id, datos)
+                # ── Detección desconocida ──────────────────────────────────
+                elif cb_data.startswith("desc_ok:") or cb_data.startswith("desc_no:"):
+                    with _pendientes_lock:
+                        datos = _pendientes_desc.pop(msg_id, None)
+                    if not datos:
+                        _responder_callback(cb_id, "⚠️ Expirada")
+                        continue
+                    if cb_data.startswith("desc_ok:"):
+                        _responder_callback(cb_id, "📢 Enviando al grupo...")
+                        _on_desconocida_confirmada(datos)
+                    else:
+                        _responder_callback(cb_id, "🗑 Ignorado")
+                        _borrar_frame(datos["frame_path"])
+                        print(f"[DESCONOCIDA] '{datos['numero']}' ignorada por validador")
 
         except requests.exceptions.Timeout:
             continue
@@ -227,13 +274,6 @@ def _procesar_callbacks():
 
 
 def _on_correcto(msg_id, datos):
-    """
-    Validador confirmó:
-      1. INSERT en SQLite
-      2. Foto al grupo MONITOR JETSON
-      3. Borra frame del disco
-      4. Notifica callback (actualiza tile en dashboard)
-    """
     numero     = datos["numero"]
     confianza  = datos["confianza"]
     ts         = datos["ts"]
@@ -241,8 +281,13 @@ def _on_correcto(msg_id, datos):
     frame_path = datos["frame_path"]
     no_det     = datos["no_detectado"]
     duracion   = datos.get("duracion", 0)
+    thumb_name = datos.get("thumb_name") # <--- NUEVO
 
-    _db_insert(no_det, numero, confianza, None, estado, duracion)
+    # Construimos la URL para el dashboard si existe el thumbnail
+    captura_url = f"/frames/crops/{thumb_name}" if thumb_name else None
+
+    # Pasamos la captura_url en lugar de None
+    _db_insert(no_det, numero, confianza, captura_url, estado, duracion)
 
     caption = (
         f"✅ *Unidad VERIFICADA*\n"
@@ -261,42 +306,46 @@ def _on_correcto(msg_id, datos):
         try: _on_validated_callback(msg_id, "VERIFICADO")
         except Exception as e: print(f"[CALLBACK ERROR] {e}")
 
-    # enviar_a_swagger(datos)   ← activar cuando llegue el endpoint
-
 
 def _on_incorrecto(msg_id, datos):
-    """
-    Validador rechazó:
-      1. Mueve frame a /revisar/ (para análisis posterior)
-      2. NO guarda en SQLite
-      3. Notifica callback (actualiza tile en dashboard)
-    """
     numero     = datos["numero"]
     frame_path = datos["frame_path"]
 
     _mover_a_revisar(frame_path)
-    print(f"[RECHAZADO] {numero} → frame movido a /revisar/")
+    print(f"[RECHAZADO] {numero} → /revisar/")
 
-    _enviar_mensaje(TG_VALIDADOR_ID, f"🗑 `{numero}` descartado → guardado en `/revisar/`")
+    _enviar_mensaje(TG_VALIDADOR_ID, f"🗑 `{numero}` descartado → `/revisar/`")
 
     if _on_validated_callback:
         try: _on_validated_callback(msg_id, "RECHAZADO")
         except Exception as e: print(f"[CALLBACK ERROR] {e}")
 
 
-# ==============================================================================
-# Swagger placeholder
-# ==============================================================================
+def _on_desconocida_confirmada(datos):
+    """Validador confirmó que la desconocida debe llegar al grupo."""
+    numero     = datos["numero"]
+    confianza  = datos["confianza"]
+    ts         = datos["ts"]
+    frame_path = datos["frame_path"]
 
-def enviar_a_swagger(datos):
-    pass
+    caption = (
+        f"🚫 *NÚMERO DESCONOCIDO*\n"
+        f"🔢 OCR leyó: `{numero}`\n"
+        f"❌ No registrado en la base de datos\n"
+        f"📊 Confianza YOLO: `{round(confianza * 100)}%`\n"
+        f"🕐 Hora: `{ts}`"
+    )
+    _enviar_foto(TG_CHAT_ID, frame_path, caption)
+    _borrar_frame(frame_path)
+    print(f"[DESCONOCIDA CONFIRMADA] '{numero}' enviada al grupo")
 
 
 # ==============================================================================
-# Alertas directas
+# Alertas directas (sin validación)
 # ==============================================================================
 
 def alerta_unidad_detectada(frame_path, numero, confianza, ts):
+    """Fallback directo al grupo (cuando falla enviar_a_validador)."""
     caption = (
         f"🚌 *Unidad detectada*\n"
         f"🔢 Número: `{numero}`\n"
@@ -304,21 +353,6 @@ def alerta_unidad_detectada(frame_path, numero, confianza, ts):
         f"🕐 Hora: `{ts}`"
     )
     _enviar_foto(TG_CHAT_ID, frame_path, caption)
-    print(f"[TELEGRAM] Detectada: {numero}")
-
-
-def alerta_unidad_desconocida(frame_path, numero, confianza, ts):
-    caption = (
-        f"🚫 *NÚMERO DESCONOCIDO*\n"
-        f"🔢 OCR leyó: `{numero}`\n"
-        f"❌ No existe en la base de datos\n"
-        f"📊 Confianza YOLO: `{round(confianza * 100)}%`\n"
-        f"🕐 Hora: `{ts}`\n"
-        f"📁 Guardado en: `unidades_desconocidas/`\n"
-        f"_⚠️ Revisar frame_"
-    )
-    _enviar_foto(TG_CHAT_ID, frame_path, caption)
-    print(f"[TELEGRAM] Desconocida: {numero}")
 
 
 # ==============================================================================
@@ -338,9 +372,16 @@ def alerta_postgres_desconectada():
 
 
 # ==============================================================================
+# Swagger placeholder
+# ==============================================================================
+
+def enviar_a_swagger(datos):
+    pass
+
+
+# ==============================================================================
 # Arranque
 # ==============================================================================
 
-_callback_thread = threading.Thread(target=_procesar_callbacks, daemon=True)
-_callback_thread.start()
+threading.Thread(target=_procesar_callbacks, daemon=True).start()
 print("[VALIDADOR] Listener de callbacks iniciado")

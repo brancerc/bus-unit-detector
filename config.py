@@ -4,27 +4,41 @@ Todas las constantes, credenciales, rutas y parámetros en un solo lugar.
 Modificar este archivo para cambios de IPs, tokens, rutas, etc.
 """
 import os
+
 # ==============================================================================
 # TELEGRAM
 # ==============================================================================
-TG_TOKEN   = "8450858285:AAFNh2MIYuZsCR7LNvE-KlYPTlUEEaX7YPo"
-TG_CHAT_ID = "-5249532175"
 TG_TOKEN        = "8450858285:AAFNh2MIYuZsCR7LNvE-KlYPTlUEEaX7YPo"
 TG_CHAT_ID      = "-5249532175"
 TG_VALIDADOR_ID = "6854120172"    # Chat ID del validador humano
 
 # ==============================================================================
 # CAMARA / RTSP
-@@ -35,11 +36,12 @@
+# ==============================================================================
+RTSP_URL = "rtsp://admin:PatioCCA_@192.168.10.2:554/cam/realmonitor?channel=1&subtype=1"
+
+PIPELINE = (
+    f"rtspsrc location={RTSP_URL} latency=100 ! "
+    "rtph264depay ! h264parse ! nvv4l2decoder ! "
+    "nvvidconv ! video/x-raw,format=BGRx ! "
+    "videoconvert ! video/x-raw,format=BGR ! appsink"
+)
+
+# ==============================================================================
+# RUTAS
+# ==============================================================================
+HLS_DIR          = "/tmp/hls"
+FRAMES_DIR       = "/media/cisa/JETSON_SD/cisa_frames"
+DESCONOCIDAS_DIR = os.path.join(FRAMES_DIR, "unidades_desconocidas")
+CROPS_DIR        = os.path.join(FRAMES_DIR, "crops")
 CLEAN_DIR        = os.path.join(FRAMES_DIR, "clean")
 CLEAN_LATERAL_DIR  = os.path.join(CLEAN_DIR, "numeroslaterales")
 CLEAN_TRASERO_DIR  = os.path.join(CLEAN_DIR, "numerostraseros")
 REVISAR_DIR        = os.path.join(FRAMES_DIR, "revisar")
 DB_PATH          = "/home/cisa/Documents/ProyectoIA/detecciones.db"
 
-# Crear directorios automaticamente
+# Crear directorios automáticamente
 for d in [HLS_DIR, FRAMES_DIR, DESCONOCIDAS_DIR, CROPS_DIR,
-          CLEAN_DIR, CLEAN_LATERAL_DIR, CLEAN_TRASERO_DIR]:
           CLEAN_DIR, CLEAN_LATERAL_DIR, CLEAN_TRASERO_DIR, REVISAR_DIR]:
     os.makedirs(d, exist_ok=True)
 
@@ -38,31 +52,35 @@ PG_CONFIG = {
     "user":     "postgres",
     "password": "",
 }
+
 # ==============================================================================
-# MODELO / DETECCION
+# MODELO / DETECCIÓN
 # ==============================================================================
-MODEL_PATH     = "best.engine"
-MODEL_CONF     = 0.70       # Subido de 0.50 → elimina falsos (Pepsi, camiones, letreros)
-COOLDOWN_SEG   = 2.0
-N_VOTOS        = 2
-VOTO_WINDOW    = 2.0
-OCR_TARGET_H   = 160        # Subido de 120 → mas pixeles para Tesseract
-OCR_MIN_SIZE   = 15
-OCR_MAX_DIGITS = 4
-OCR_MIN_DIGITS = 3
+MODEL_PATH      = "best.engine"
+MODEL_CONF      = 0.70      # Subido de 0.50 → elimina falsos (Pepsi, camiones, letreros)
+COOLDOWN_SEG    = 2.0
+N_VOTOS         = 2
+VOTO_WINDOW     = 2.0
+OCR_TARGET_H    = 160       # Subido de 120 → más píxeles para Tesseract
+OCR_MIN_SIZE    = 15
+OCR_MAX_DIGITS  = 4
+OCR_MIN_DIGITS  = 3
 LEVENSHTEIN_MAX = 1
-ID_PUERTA       = 1        # Identificador de la puerta/camara actual
+ID_PUERTA       = 1         # Identificador de la puerta/cámara actual
+
 # ==============================================================================
 # HLS STREAMING
 # ==============================================================================
 HLS_TIMEOUT    = 15
 HLS_RESOLUTION = (704, 480)
 HLS_FPS        = 15
+
 # ==============================================================================
 # SERVIDOR FLASK
 # ==============================================================================
 FLASK_HOST = "0.0.0.0"
 FLASK_PORT = 5001
+
 # ==============================================================================
 # REFRESCO DE UNIDADES (segundos)
 # ==============================================================================

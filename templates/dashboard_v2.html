@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CISA Monitor</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+
+body {
+  background: #f3f4f6;
+  color: #111827;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Header ─────────────────────────────────────────────────────────────── */
+#header {
+  background: #fff;
+  border-bottom: 1px solid #e5e7eb;
+  padding: 0 16px;
+  height: 48px;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.08);
+  flex-shrink: 0;
+}
+
+.logo {
+  font-size: 15px;
+  font-weight: 800;
+  color: #cc1f1f;
+  letter-spacing: .14em;
+  padding-right: 14px;
+  border-right: 2px solid #e5e7eb;
+  margin-right: 4px;
+  white-space: nowrap;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  color: #4b5563;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.dot { width: 7px; height: 7px; border-radius: 50%; background: #f59e0b; flex-shrink: 0; }
+.dot.ok  { background: #22c55e; box-shadow: 0 0 4px #22c55e88; }
+.dot.err { background: #cc1f1f; }
+
+.track-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #fef2f2;
+  border: 1px solid #fca5a5;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #cc1f1f;
+  white-space: nowrap;
+}
+.track-badge.hidden { display: none; }
+
+.spacer { flex: 1; }
+.hora { font-size: 12px; color: #9ca3af; font-variant-numeric: tabular-nums; }
+
+/* ── Layout ──────────────────────────────────────────────────────────────── */
+#main { display: flex; flex: 1; min-height: 0; overflow: hidden; }
+
+/* ── Video ───────────────────────────────────────────────────────────────── */
+#video-panel {
+  flex: 1;
+  background: #0a0a0a;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+}
+
+#video { width: 100%; height: 100%; object-fit: contain; display: block; }
+
+#vid-overlay {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 12px;
+  background: rgba(0,0,0,.55);
+}
+#vid-overlay.hidden { display: none; }
+
+.spinner {
+  width: 30px; height: 30px;
+  border: 2.5px solid rgba(255,255,255,.2);
+  border-top-color: #cc1f1f;
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.overlay-txt { font-size: 12px; color: rgba(255,255,255,.55); font-weight: 500; }
+
+/* ── Panel detecciones ───────────────────────────────────────────────────── */
+#det-panel {
+  width: 290px;
+  flex-shrink: 0;
+  background: #fff;
+  border-left: 1px solid #e5e7eb;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#det-header {
+  padding: 10px 14px;
+  border-bottom: 1px solid #e5e7eb;
+  display: flex; align-items: center; justify-content: space-between;
+  flex-shrink: 0;
+}
+.panel-title { font-size: 10.5px; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: .1em; }
+#panel-count { background: #cc1f1f; color: #fff; font-size: 10px; font-weight: 700; padding: 1px 8px; border-radius: 999px; min-width: 22px; text-align: center; }
+
+#tiles {
+  flex: 1; overflow-y: auto; padding: 8px;
+  display: flex; flex-direction: column; gap: 6px;
+  background: #f9fafb; min-height: 0;
+}
+#tiles::-webkit-scrollbar { width: 4px; }
+#tiles::-webkit-scrollbar-track { background: transparent; }
+#tiles::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 4px; }
+
+/* ── Tile ────────────────────────────────────────────────────────────────── */
+.tile {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-left: 3px solid #d1d5db;
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex; align-items: center; gap: 10px;
+  flex-shrink: 0;
+  cursor: pointer;
+  transition: box-shadow .15s;
+  animation: slideIn .2s ease;
+}
+.tile:hover { box-shadow: 0 2px 8px rgba(0,0,0,.12); }
+@keyframes slideIn { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: none; } }
+
+.tile.s-pendiente  { border-left-color: #d97706; background: #fffbeb; }
+.tile.s-VERIFICADO { border-left-color: #15803d; background: #f0fdf4; }
+.tile.s-CORREGIDO  { border-left-color: #2563eb; background: #eff6ff; }
+.tile.s-RECHAZADO  { border-left-color: #cc1f1f; background: #fef2f2; }
+
+/* Imagen del tile: thumbnail del frame del bus */
+.tile-img {
+  width: 80px; height: 48px;
+  object-fit: cover;
+  border-radius: 5px;
+  background: #f3f4f6;
+  border: 1px solid #e5e7eb;
+  flex-shrink: 0;
+}
+.tile-ph {
+  width: 80px; height: 48px;
+  background: #f3f4f6; border: 1px solid #e5e7eb;
+  border-radius: 5px; display: flex;
+  align-items: center; justify-content: center;
+  color: #9ca3af; font-size: 18px; flex-shrink: 0;
+}
+
+.tile-body { flex: 1; min-width: 0; }
+.tile-num {
+  font-size: 24px; font-weight: 800; line-height: 1;
+  font-variant-numeric: tabular-nums; color: #111827;
+}
+.tile-meta { display: flex; align-items: center; gap: 5px; margin-top: 5px; }
+
+.badge {
+  font-size: 9.5px; font-weight: 700; padding: 2px 6px;
+  border-radius: 4px; text-transform: uppercase;
+  letter-spacing: .05em; border: 1px solid transparent;
+}
+.b-pendiente  { background: #fffbeb; color: #b45309; border-color: #fcd34d; }
+.b-VERIFICADO { background: #f0fdf4; color: #15803d; border-color: #86efac; }
+.b-CORREGIDO  { background: #eff6ff; color: #1d4ed8; border-color: #93c5fd; }
+.b-RECHAZADO  { background: #fef2f2; color: #cc1f1f; border-color: #fca5a5; }
+
+.tile-time { font-size: 10px; color: #9ca3af; font-variant-numeric: tabular-nums; }
+
+/* ── Empty ───────────────────────────────────────────────────────────────── */
+#empty {
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 10px; color: #9ca3af; font-size: 13px;
+  font-weight: 500; text-align: center; padding: 40px 20px;
+}
+.empty-icon { font-size: 36px; opacity: .35; }
+
+/* ── Modal ───────────────────────────────────────────────────────────────── */
+#modal {
+  display: none;
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(0,0,0,.72);
+  align-items: center; justify-content: center;
+  padding: 16px;
+}
+#modal.open { display: flex; }
+
+#modal-box {
+  background: #fff;
+  border-radius: 12px;
+  width: 100%; max-width: 560px;
+  overflow: hidden;
+  box-shadow: 0 20px 50px rgba(0,0,0,.4);
+  position: relative;
+  animation: popIn .18s ease;
+}
+@keyframes popIn { from { opacity: 0; transform: scale(.94); } to { opacity: 1; transform: none; } }
+
+#modal-img {
+  width: 100%; height: 280px;
+  object-fit: contain;
+  background: #0a0a0a; display: block;
+}
+
+#modal-body { padding: 16px 18px 18px; }
+
+#modal-num {
+  font-size: 52px; font-weight: 900; line-height: 1;
+  font-variant-numeric: tabular-nums; color: #111827;
+  margin-bottom: 12px;
+}
+
+.mrow {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 7px 0; border-bottom: 1px solid #f3f4f6;
+  font-size: 13px;
+}
+.mrow:last-child { border-bottom: none; }
+.mlabel { color: #6b7280; font-weight: 500; }
+.mval   { color: #111827; font-weight: 600; text-align: right; }
+
+#modal-close {
+  position: absolute; top: 10px; right: 10px;
+  background: rgba(0,0,0,.45); color: #fff;
+  border: none; width: 28px; height: 28px;
+  border-radius: 50%; cursor: pointer; font-size: 15px;
+  display: flex; align-items: center; justify-content: center;
+}
+#modal-close:hover { background: rgba(0,0,0,.7); }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <div class="logo">CISA</div>
+  <div class="pill"><div class="dot" id="dot-yolo"></div><span id="txt-yolo">YOLO…</span></div>
+  <div class="pill"><div class="dot" id="dot-pg"></div><span id="txt-pg">PG</span></div>
+  <div class="pill"><div class="dot" id="dot-cam"></div><span id="txt-cam">CAM</span></div>
+  <div class="track-badge hidden" id="track-badge">🚌 <span id="track-txt">—</span></div>
+  <div class="spacer"></div>
+  <div class="hora" id="hora">—</div>
+</div>
+
+<div id="main">
+  <div id="video-panel">
+    <video id="video" autoplay muted playsinline></video>
+    <div id="vid-overlay">
+      <div class="spinner"></div>
+      <div class="overlay-txt">Conectando al stream…</div>
+    </div>
+  </div>
+
+  <div id="det-panel">
+    <div id="det-header">
+      <span class="panel-title">Detecciones</span>
+      <span id="panel-count">0</span>
+    </div>
+    <div id="tiles">
+      <div id="empty"><div class="empty-icon">🚌</div>Esperando detecciones…</div>
+    </div>
+  </div>
+</div>
+
+<!-- Modal detalle -->
+<div id="modal" onclick="if(event.target===this)closeModal()">
+  <div id="modal-box">
+    <button id="modal-close" onclick="closeModal()">✕</button>
+    <img id="modal-img" src="" alt="">
+    <div id="modal-body">
+      <div id="modal-num">—</div>
+      <div class="mrow"><span class="mlabel">OCR leyó</span><span class="mval" id="m-leido">—</span></div>
+      <div class="mrow"><span class="mlabel">Estado</span><span class="mval" id="m-estado">—</span></div>
+      <div class="mrow"><span class="mlabel">Confianza YOLO</span><span class="mval" id="m-conf">—</span></div>
+      <div class="mrow"><span class="mlabel">Hora</span><span class="mval" id="m-ts">—</span></div>
+      <div class="mrow"><span class="mlabel">Clase</span><span class="mval" id="m-cls">—</span></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<script>
+'use strict';
+
+// ── Modal ─────────────────────────────────────────────────────────────────────
+function openModal(infoStr) {
+  try {
+    var d = JSON.parse(infoStr);
+    // Intentar frame completo primero; si 404, caer al thumbnail
+    var imgEl = document.getElementById('modal-img');
+    var src = d.frame_url || d.thumb_url || '';
+    imgEl.onerror = function() {
+      if (d.thumb_url && imgEl.src !== d.thumb_url) { imgEl.src = d.thumb_url; }
+    };
+    imgEl.src = src;
+    document.getElementById('modal-num').textContent = d.numero || '—';
+    document.getElementById('m-leido').textContent  = d.leido || d.no_detectado || d.numero || '—';
+    document.getElementById('m-estado').textContent = d.estado || '—';
+    document.getElementById('m-conf').textContent   = d.conf ? Math.round(d.conf * 100) + '%' : '—';
+    document.getElementById('m-ts').textContent     = d.ts || d.hora_paso || '—';
+    document.getElementById('m-cls').textContent    = (d.cls || '').replace('numero_', '') || '—';
+    document.getElementById('modal').classList.add('open');
+  } catch(e) { console.error(e); }
+}
+function closeModal() {
+  document.getElementById('modal').classList.remove('open');
+  document.getElementById('modal-img').src = '';
+}
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') closeModal();
+});
+
+// ── HLS ──────────────────────────────────────────────────────────────────────
+var video   = document.getElementById('video');
+var overlay = document.getElementById('vid-overlay');
+var hls, hlsRetries = 0;
+
+function initHLS() {
+  fetch('/api/hls-start').catch(function(){});
+  setTimeout(startPlayer, 1500);
+}
+
+function startPlayer() {
+  if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+    if (hls) { hls.destroy(); }
+    hls = new Hls({
+      enableWorker:   true,
+      lowLatencyMode: true,
+      backBufferLength: 4,
+      maxBufferLength: 8,
+      liveSyncDurationCount: 2,
+    });
+    hls.loadSource('/hls/stream.m3u8');
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, function() {
+      video.play().catch(function(){});
+      overlay.classList.add('hidden');
+      hlsRetries = 0;
+    });
+    hls.on(Hls.Events.ERROR, function(e, d) {
+      if (d.fatal) {
+        hlsRetries++;
+        var delay = Math.min(hlsRetries * 2000, 10000);
+        setTimeout(startPlayer, delay);
+      }
+    });
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.src = '/hls/stream.m3u8';
+    video.addEventListener('loadedmetadata', function() {
+      video.play().catch(function(){});
+      overlay.classList.add('hidden');
+    });
+  }
+}
+
+setInterval(function(){ fetch('/api/hls-ping').catch(function(){}); }, 5000);
+initHLS();
+
+// ── Estado ────────────────────────────────────────────────────────────────────
+function setDot(id, ok) {
+  document.getElementById(id).className = 'dot' + (ok ? ' ok' : ' err');
+}
+function pollEstado() {
+  fetch('/api/estado')
+    .then(function(r){ return r.json(); })
+    .then(function(d) {
+      setDot('dot-yolo', d.yolo_fps > 0);
+      document.getElementById('txt-yolo').textContent = 'YOLO ' + (d.yolo_fps||0) + ' fps';
+      setDot('dot-pg', d.pg_conectada);
+      document.getElementById('txt-pg').textContent =
+        d.pg_conectada ? 'PG ' + d.unidades_registradas + 'u' : 'PG ERR';
+      setDot('dot-cam', d.pipeline);
+      document.getElementById('txt-cam').textContent = d.pipeline ? 'CAM OK' : 'CAM ERR';
+      var tb = document.getElementById('track-badge');
+      if (d.tracking) {
+        document.getElementById('track-txt').textContent =
+          d.tracking + ' · ' + Math.round(d.tracking_duracion||0) + 's';
+        tb.classList.remove('hidden');
+      } else {
+        tb.classList.add('hidden');
+      }
+      document.getElementById('hora').textContent = new Date().toLocaleTimeString('es-MX');
+    }).catch(function(){});
+}
+setInterval(pollEstado, 1000);
+pollEstado();
+
+// ── Detecciones ───────────────────────────────────────────────────────────────
+var tilesEl  = document.getElementById('tiles');
+var emptyEl  = document.getElementById('empty');
+var countEl  = document.getElementById('panel-count');
+var seen     = {};
+var byMsgId  = {};
+var MAX_TILES = 30;
+
+var ESTADOS = {
+  'pendiente':  { tile: 's-pendiente',  badge: 'b-pendiente',  label: '⏳ Pendiente' },
+  'VERIFICADO': { tile: 's-VERIFICADO', badge: 'b-VERIFICADO', label: '✓ Verificado' },
+  'CORREGIDO':  { tile: 's-CORREGIDO',  badge: 'b-CORREGIDO',  label: '✎ Corregido'  },
+  'RECHAZADO':  { tile: 's-RECHAZADO',  badge: 'b-RECHAZADO',  label: '✗ Rechazado'  },
+};
+function getE(e) { return ESTADOS[e] || ESTADOS['pendiente']; }
+
+function fmtTime(ts) {
+  if (!ts) return '';
+  try { return new Date(ts.replace(' ','T')).toLocaleTimeString('es-MX',
+    {hour:'2-digit',minute:'2-digit',second:'2-digit'}); }
+  catch(e) { return String(ts).slice(-8); }
+}
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function makeTile(data) {
+  var num      = data.numero || data.no_economico || data.no_detectado || '—';
+  var estado   = data.estado || 'VERIFICADO';
+  var ts       = data.ts     || data.hora_paso   || '';
+  var thumbUrl = data.thumb_url || null;
+  var frameUrl = data.frame_url || null;
+  var info     = getE(estado);
+
+  var div = document.createElement('div');
+  div.className = 'tile ' + info.tile;
+  div.setAttribute('data-info', JSON.stringify(data));
+  div.onclick = function() { openModal(this.getAttribute('data-info')); };
+
+  // Imagen: thumbnail del frame completo (URL, no base64)
+  var imgHtml;
+  if (thumbUrl) {
+    imgHtml = '<img class="tile-img" src="' + esc(thumbUrl) + '" alt="' + esc(num) + '" '
+            + 'onerror="this.style.display=\'none\';this.nextSibling.style.display=\'flex\'">'
+            + '<div class="tile-ph" style="display:none">🚌</div>';
+  } else {
+    imgHtml = '<div class="tile-ph">🚌</div>';
+  }
+
+  div.innerHTML = imgHtml
+    + '<div class="tile-body">'
+    +   '<div class="tile-num">' + esc(num) + '</div>'
+    +   '<div class="tile-meta">'
+    +     '<span class="badge ' + info.badge + '" data-badge>' + info.label + '</span>'
+    +     '<span class="tile-time">' + fmtTime(ts) + '</span>'
+    +   '</div>'
+    + '</div>';
+
+  if (data.msg_id) byMsgId[data.msg_id] = div;
+  return div;
+}
+
+function updateTile(tile, estado, newData) {
+  var info = getE(estado);
+  tile.className = 'tile ' + info.tile;
+  var b = tile.querySelector('[data-badge]');
+  if (b) { b.className = 'badge ' + info.badge; b.textContent = info.label; }
+  // Actualizar data-info para que el modal muestre el estado correcto
+  try {
+    var d = JSON.parse(tile.getAttribute('data-info'));
+    d.estado = estado;
+    tile.setAttribute('data-info', JSON.stringify(d));
+  } catch(e) {}
+}
+
+function insertTile(tile) {
+  if (tilesEl.contains(emptyEl)) tilesEl.removeChild(emptyEl);
+  tilesEl.insertBefore(tile, tilesEl.firstChild);
+}
+
+function tileKey(item, kind) {
+  var ts  = item.ts  || item.hora_paso  || '';
+  var num = item.numero || item.no_economico || item.no_detectado || '';
+  return kind + ':' + ts + ':' + num;
+}
+
+function pollDetecciones() {
+  fetch('/api/detecciones-recent')
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      var pending  = data.pending  || [];
+      var approved = data.approved || [];
+
+      for (var i = 0; i < pending.length; i++) {
+        var p   = pending[i];
+        var mid = p.msg_id;
+
+        // Si ya existe el tile → solo actualizar estado si cambió
+        if (mid && byMsgId[mid]) {
+          var cur = byMsgId[mid].className;
+          var exp = 'tile ' + getE(p.estado).tile;
+          if (cur !== exp) updateTile(byMsgId[mid], p.estado);
+          continue;
+        }
+
+        var key = tileKey(p, 'p');
+        if (seen[key]) continue;
+        seen[key] = true;
+        insertTile(makeTile(p));
+      }
+
+      for (var j = 0; j < approved.length; j++) {
+        var a    = approved[j];
+        var key2 = tileKey(a, 'a');
+        if (seen[key2]) continue;
+        seen[key2] = true;
+        insertTile(makeTile(a));
+      }
+
+      // Limpiar tiles viejos
+      var all = tilesEl.querySelectorAll('.tile');
+      while (all.length > MAX_TILES) {
+        var last = tilesEl.lastElementChild;
+        if (last && last !== emptyEl) {
+          if (last.dataset && last.dataset.mid) delete byMsgId[last.dataset.mid];
+          tilesEl.removeChild(last);
+          all = tilesEl.querySelectorAll('.tile');
+        } else break;
+      }
+
+      if (seen && Object.keys(seen).length > 300) { seen = {}; }
+
+      var n = tilesEl.querySelectorAll('.tile').length;
+      countEl.textContent = n;
+      if (n === 0 && !tilesEl.contains(emptyEl)) tilesEl.appendChild(emptyEl);
+    }).catch(function(){});
+}
+
+setInterval(pollDetecciones, 800);
+pollDetecciones();
+</script>
+</body>
+</html>
