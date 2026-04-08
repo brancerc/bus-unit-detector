@@ -6,32 +6,121 @@
   <title>CISA · Número económico</title>
   <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;900&display=swap" rel="stylesheet">
   <style>
-    :root{--verde:#00ff88;--fondo:#060809;}
-    *{margin:0;padding:0;box-sizing:border-box;}
-    body{background:var(--fondo);min-height:100vh;display:flex;flex-direction:column;
-         align-items:center;justify-content:center;font-family:'Barlow Condensed',sans-serif;}
-    .label{font-size:11px;font-weight:700;letter-spacing:5px;text-transform:uppercase;
-           color:#2a3a2a;margin-bottom:16px;}
-    .numero{font-family:'Share Tech Mono',monospace;font-size:clamp(100px,18vw,220px);
-            line-height:1;color:var(--verde);text-shadow:0 0 80px rgba(0,255,136,.2);
-            letter-spacing:8px;text-align:center;word-break:break-all;padding:0 20px;}
-    .numero.vacio{color:#0d1f0d;}
-    .numero.flash{animation:flash .35s ease forwards;}
-    @keyframes flash{0%{color:#fff;text-shadow:0 0 120px #fff;}
-                     100%{color:var(--verde);text-shadow:0 0 80px rgba(0,255,136,.2);}}
-    .conf{margin-top:18px;font-family:'Share Tech Mono',monospace;font-size:13px;
-          color:#1a2f1a;letter-spacing:3px;text-transform:uppercase;transition:color .3s;}
-    .conf.visible{color:#2a5a2a;}
-    .ts{margin-top:8px;font-family:'Share Tech Mono',monospace;font-size:12px;
-        color:#141e14;letter-spacing:2px;}
-    .live-link{position:fixed;bottom:28px;right:32px;font-family:'Share Tech Mono',monospace;
-               font-size:11px;letter-spacing:3px;text-transform:uppercase;color:#1c2c1c;
-               text-decoration:none;border:1px solid #1c2c1c;padding:8px 16px;
-               border-radius:20px;transition:all .25s;}
-    .live-link:hover{color:var(--verde);border-color:var(--verde);text-shadow:0 0 10px var(--verde);}
-    .dot{position:fixed;top:24px;right:28px;width:8px;height:8px;border-radius:50%;background:#0d1f0d;}
-    .dot.ok{background:var(--verde);box-shadow:0 0 8px var(--verde);animation:pulse 2s ease-in-out infinite;}
-    @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.3;}}
+    /* Variables actualizadas: Fondo blanco y Acento Rojo */
+    :root {
+      --rojo: #ff3b30;
+      --fondo: #ffffff;
+      --texto-secundario: #8e8e93;
+    }
+
+    * {margin:0; padding:0; box-sizing:border-box;}
+
+    body {
+      background: var(--fondo);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      font-family: 'Barlow Condensed', sans-serif;
+      color: #1c1c1e;
+    }
+
+    .label {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 5px;
+      text-transform: uppercase;
+      color: var(--texto-secundario);
+      margin-bottom: 16px;
+    }
+
+    /* El número ahora es Rojo */
+    .numero {
+      font-family: 'Share Tech Mono', monospace;
+      font-size: clamp(100px, 18vw, 220px);
+      line-height: 1;
+      color: var(--rojo);
+      text-shadow: 0 0 40px rgba(255, 59, 48, 0.15);
+      letter-spacing: 8px;
+      text-align: center;
+      word-break: break-all;
+      padding: 0 20px;
+    }
+
+    .numero.vacio { color: #e5e5ea; }
+
+    /* Animación de destello ajustada a rojo/blanco */
+    .numero.flash { animation: flash .35s ease forwards; }
+
+    @keyframes flash {
+      0% { color: #ff9500; text-shadow: 0 0 120px #ff3b30; }
+      100% { color: var(--rojo); text-shadow: 0 0 40px rgba(255, 59, 48, 0.15); }
+    }
+
+    .conf {
+      margin-top: 18px;
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 13px;
+      color: #d1d1d6;
+      letter-spacing: 3px;
+      text-transform: uppercase;
+      transition: color .3s;
+    }
+
+    .conf.visible { color: var(--texto-secundario); }
+
+    .ts {
+      margin-top: 8px;
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 12px;
+      color: #c7c7cc;
+      letter-spacing: 2px;
+    }
+
+    /* Botón inferior derecho: Fondo Rojo, Letras Blancas */
+    .live-link {
+      position: fixed;
+      bottom: 28px;
+      right: 32px;
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 11px;
+      letter-spacing: 3px;
+      text-transform: uppercase;
+      color: #ffffff;
+      background-color: var(--rojo);
+      text-decoration: none;
+      border: 1px solid var(--rojo);
+      padding: 10px 20px;
+      border-radius: 20px;
+      transition: all .25s;
+      box-shadow: 0 4px 15px rgba(255, 59, 48, 0.3);
+    }
+
+    .live-link:hover {
+      background-color: #d70015;
+      border-color: #d70015;
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(255, 59, 48, 0.4);
+    }
+
+    .dot {
+      position: fixed;
+      top: 24px;
+      right: 28px;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #e5e5ea;
+    }
+
+    .dot.ok {
+      background: var(--rojo);
+      box-shadow: 0 0 8px var(--rojo);
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse { 0%, 100% {opacity:1;} 50% {opacity:.3;} }
   </style>
 </head>
 <body>
@@ -39,29 +128,36 @@
   <div class="label">CISA · número económico</div>
   <div class="numero vacio" id="numero">----</div>
   <div class="conf" id="conf">confianza —</div>
-  <div class="ts"   id="ts"></div>
+  <div class="ts" id="ts"></div>
   <a class="live-link" href="/livevideo">▶ live video</a>
+  
   <script>
-    let prev=null;
-    async function poll(){
-      try{
-        const d=await fetch('/api/estado').then(r=>r.json());
-        document.getElementById('dot').className='dot '+(d.pipeline?'ok':'');
-        if(d.numero){
-          const el=document.getElementById('numero');
-          if(d.numero!==prev){
-            el.classList.remove('flash','vacio');void el.offsetWidth;
-            el.classList.add('flash');prev=d.numero;
-          }else el.classList.remove('vacio');
-          el.textContent=d.numero;
-          const pct=Math.round((d.conf||0)*100);
-          const cEl=document.getElementById('conf');
-          cEl.textContent='confianza  '+pct+'%';cEl.className='conf visible';
-          document.getElementById('ts').textContent=d.ts||'';
+    let prev = null;
+    async function poll() {
+      try {
+        const d = await fetch('/api/estado').then(r => r.json());
+        document.getElementById('dot').className = 'dot ' + (d.pipeline ? 'ok' : '');
+        if (d.numero) {
+          const el = document.getElementById('numero');
+          if (d.numero !== prev) {
+            el.classList.remove('flash', 'vacio');
+            void el.offsetWidth;
+            el.classList.add('flash');
+            prev = d.numero;
+          } else {
+            el.classList.remove('vacio');
+          }
+          el.textContent = d.numero;
+          const pct = Math.round((d.conf || 0) * 100);
+          const cEl = document.getElementById('conf');
+          cEl.textContent = 'confianza  ' + pct + '%';
+          cEl.className = 'conf visible';
+          document.getElementById('ts').textContent = d.ts || '';
         }
-      }catch(e){}
+      } catch(e) {}
     }
-    poll();setInterval(poll,1000);
+    poll();
+    setInterval(poll, 1000);
   </script>
 </body>
 </html>

@@ -77,6 +77,25 @@ body {
 .spacer { flex: 1; }
 .hora { font-size: 12px; color: #9ca3af; font-variant-numeric: tabular-nums; }
 
+/* ── Botones de selección de cámara (experimental) ──────────────────────── */
+.cam-btn {
+  background: #cc1f1f;
+  color: #fff;
+  border: none;
+  padding: 4px 13px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  letter-spacing: .04em;
+  transition: background .15s, opacity .15s;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.cam-btn:hover   { background: #a81a1a; }
+.cam-btn.active  { background: #7f1212; box-shadow: inset 0 1px 3px rgba(0,0,0,.3); }
+.cam-btn.loading { opacity: .5; cursor: default; }
+
 /* ── Layout ──────────────────────────────────────────────────────────────── */
 #main { display: flex; flex: 1; min-height: 0; overflow: hidden; }
 
@@ -101,6 +120,29 @@ body {
   background: rgba(0,0,0,.55);
 }
 #vid-overlay.hidden { display: none; }
+
+/* EXPERIMENTAL: overlay de cambio de cámara */
+#cam-switching {
+  position: absolute; inset: 0;
+  display: none;
+  flex-direction: column;
+  align-items: center; justify-content: center; gap: 14px;
+  background: rgba(0,0,0,.75);
+  z-index: 5;
+}
+#cam-switching.show { display: flex; }
+#cam-switching .sw-spinner {
+  width: 36px; height: 36px;
+  border: 3px solid rgba(255,255,255,.2);
+  border-top-color: #cc1f1f;
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+#cam-switching .sw-text {
+  font-size: 13px; font-weight: 600;
+  color: rgba(255,255,255,.85);
+  letter-spacing: .05em;
+}
 
 .spinner {
   width: 30px; height: 30px;
@@ -270,6 +312,9 @@ body {
   <div class="pill"><div class="dot" id="dot-cam"></div><span id="txt-cam">CAM</span></div>
   <div class="track-badge hidden" id="track-badge">🚌 <span id="track-txt">—</span></div>
   <div class="spacer"></div>
+  <!-- EXPERIMENTAL: selector de cámara — ver switchCamera() y /api/switch-camera -->
+  <button class="cam-btn active" id="btn-cam1" onclick="switchCamera(1)">Cam 1</button>
+  <button class="cam-btn"        id="btn-cam2" onclick="switchCamera(2)">Cam 2</button>
   <div class="hora" id="hora">—</div>
 </div>
 
@@ -279,6 +324,11 @@ body {
     <div id="vid-overlay">
       <div class="spinner"></div>
       <div class="overlay-txt">Conectando al stream…</div>
+    </div>
+    <!-- EXPERIMENTAL: overlay durante switch de cámara -->
+    <div id="cam-switching">
+      <div class="sw-spinner"></div>
+      <div class="sw-text" id="sw-text">CONECTANDO CÁMARA…</div>
     </div>
   </div>
 
@@ -319,9 +369,10 @@ function openModal(infoStr) {
     var d = JSON.parse(infoStr);
     // Intentar frame completo primero; si 404, caer al thumbnail
     var imgEl = document.getElementById('modal-img');
-    var src = d.frame_url || d.thumb_url || '';
+    var src = d.frame_url || d.thumb_url || d.captura_url || '';
     imgEl.onerror = function() {
-      if (d.thumb_url && imgEl.src !== d.thumb_url) { imgEl.src = d.thumb_url; }
+      var fallback = d.thumb_url || d.captura_url;
+      if (fallback && imgEl.src.indexOf(fallback) === -1) { imgEl.src = fallback; }
     };
     imgEl.src = src;
     document.getElementById('modal-num').textContent = d.numero || '—';
@@ -345,6 +396,12 @@ document.addEventListener('keydown', function(e) {
 var video   = document.getElementById('video');
 var overlay = document.getElementById('vid-overlay');
 var hls, hlsRetries = 0;
+
+video.addEventListener('playing', function() {
+    // El video ya está reproduciendo la nueva fuente real
+    isVideoTransitioning = false; 
+    document.getElementById('cam-switching').classList.remove('show');
+});
 
 function initHLS() {
   fetch('/api/hls-start').catch(function(){});
@@ -387,6 +444,60 @@ function startPlayer() {
 setInterval(function(){ fetch('/api/hls-ping').catch(function(){}); }, 5000);
 initHLS();
 
+// ── EXPERIMENTAL: Selector de cámara ─────────────────────────────────────────
+// Llama a /api/switch-camera en el backend para cambiar el pipeline RTSP.
+// El HLS se reinicia automáticamente con la nueva fuente.
+// Impacto en rendimiento: el pipeline se cierra y reabre (~3-5s sin video).
+// YOLO y OCR continúan con el último frame hasta que el nuevo pipeline esté listo.
+var _activeCam = 1;
+var isVideoTransitioning = false;
+
+function switchCamera(num) {
+  if (num === _activeCam) return;
+  
+  isVideoTransitioning = true; // <--- AGREGAR AQUÍ
+
+  var btn1 = document.getElementById('btn-cam1');
+  var btn2 = document.getElementById('btn-cam2');
+  var activeBtn   = num === 1 ? btn1 : btn2;
+  var inactiveBtn = num === 1 ? btn2 : btn1;
+
+  // Feedback visual inmediato
+  activeBtn.classList.add('loading');
+  activeBtn.textContent = 'Cam ' + num + '…';
+
+  fetch('/api/switch-camera', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({camera: num})
+  })
+  .then(function(r){ return r.json(); })
+  .then(function(d) {
+    if (d.ok) {
+      _activeCam = num;
+      activeBtn.classList.remove('loading');
+      activeBtn.classList.add('active');
+      activeBtn.textContent = 'Cam ' + num;
+      inactiveBtn.classList.remove('active');
+      // Reiniciar HLS con la nueva fuente (esperar 2s a que el pipeline abra)
+      setTimeout(function() {
+        if (hls) { hls.stopLoad(); hls.detachMedia(); }
+        setTimeout(startPlayer, 500);
+      }, 2000);
+    } else {
+      activeBtn.classList.remove('loading');
+      activeBtn.textContent = 'Cam ' + num;
+      alert('Error al cambiar cámara: ' + (d.error || 'desconocido'));
+    }
+  })
+  .catch(function(e) {
+    activeBtn.classList.remove('loading');
+    activeBtn.textContent = 'Cam ' + num;
+    alert('No se pudo contactar al servidor');
+  });
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ── Estado ────────────────────────────────────────────────────────────────────
 function setDot(id, ok) {
   document.getElementById(id).className = 'dot' + (ok ? ' ok' : ' err');
@@ -402,6 +513,35 @@ function pollEstado() {
         d.pg_conectada ? 'PG ' + d.unidades_registradas + 'u' : 'PG ERR';
       setDot('dot-cam', d.pipeline);
       document.getElementById('txt-cam').textContent = d.pipeline ? 'CAM OK' : 'CAM ERR';
+
+      // EXPERIMENTAL: overlay de cambio de cámara
+      var swOverlay = document.getElementById('cam-switching');
+      var btn1 = document.getElementById('btn-cam1');
+      var btn2 = document.getElementById('btn-cam2');
+      
+      // ANTES: if (d.switching) {
+      // AHORA:
+      if (d.switching || isVideoTransitioning) {
+        swOverlay.classList.add('show');
+        document.getElementById('sw-text').textContent =
+          'CONECTANDO CAM ' + (d.active_camera || '') + '…';
+        // Deshabilitar botones durante switch para evitar peticiones múltiples
+        btn1.disabled = true; btn1.style.opacity = '.5';
+        btn2.disabled = true; btn2.style.opacity = '.5';
+      } else {
+        swOverlay.classList.remove('show');
+        btn1.disabled = false; btn1.style.opacity = '';
+        btn2.disabled = false; btn2.style.opacity = '';
+      }
+
+      // EXPERIMENTAL: sincronizar botones de cámara con el estado del servidor
+      if (d.active_camera && d.active_camera !== _activeCam) {
+        _activeCam = d.active_camera;
+        document.getElementById('btn-cam1').className =
+          'cam-btn' + (_activeCam === 1 ? ' active' : '');
+        document.getElementById('btn-cam2').className =
+          'cam-btn' + (_activeCam === 2 ? ' active' : '');
+      }
       var tb = document.getElementById('track-badge');
       if (d.tracking) {
         document.getElementById('track-txt').textContent =
@@ -446,7 +586,9 @@ function makeTile(data) {
   var num      = data.numero || data.no_economico || data.no_detectado || '—';
   var estado   = data.estado || 'VERIFICADO';
   var ts       = data.ts     || data.hora_paso   || '';
-  var thumbUrl = data.thumb_url || null;
+  // thumb_url → detecciones pendientes en memoria
+  // captura_url → detecciones aprobadas desde SQLite (mismo path, distinto campo)
+  var thumbUrl = data.thumb_url || data.captura_url || null;
   var frameUrl = data.frame_url || null;
   var info     = getE(estado);
 

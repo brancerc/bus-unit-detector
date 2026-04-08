@@ -38,11 +38,14 @@ def set_validation_callback(fn):
 
 
 # ==============================================================================
-# SQLite
+# SQLite — solo cuando el validador aprueba
 # ==============================================================================
 
 def _db_insert(no_detectado, no_economico, confianza, captura_url=None,
-               estado="VERIFICADO", duracion=0):
+               estado="VERIFICADO", duracion=0, puerta_id=None):
+    """Inserta en SQLite. puerta_id=None usa el ID_PUERTA de config (Cam 1)."""
+    if puerta_id is None:
+        puerta_id = ID_PUERTA
     now = datetime.now()
     try:
         con = sqlite3.connect(DB_PATH)
@@ -52,11 +55,11 @@ def _db_insert(no_detectado, no_economico, confianza, captura_url=None,
                 hora_registro, captura_url, estado, confianza, duracion_camara)
                VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (no_detectado, no_economico, "entrada",
-             now.strftime("%Y-%m-%d %H:%M:%S"), ID_PUERTA,
+             now.strftime("%Y-%m-%d %H:%M:%S"), puerta_id,
              now.strftime("%Y-%m-%d %H:%M:%S"), captura_url,
              estado, round(confianza, 3), round(duracion, 1)))
         con.commit(); con.close()
-        print(f"[DB] Insertado: {no_economico} | dur: {duracion}s")
+        print(f"[DB] Insertado: {no_economico} | puerta={puerta_id} | dur={duracion}s")
     except Exception as e:
         print(f"[DB ERROR] {e}")
 
@@ -126,9 +129,19 @@ def _mover_a_revisar(frame_path):
 # Validación — detecciones CONOCIDAS
 # ==============================================================================
 
-def enviar_a_validador(frame_path, numero, confianza, ts, estado, no_detectado=None, thumb_name=None):
+def enviar_a_validador(frame_path, numero, confianza, ts, estado,
+                       no_detectado=None, thumb_name=None,
+                       puerta_id=None, camera_label='Cam 1'):
+    """
+    Envía al validador con botones ✓/✗.
+    puerta_id: ID de la puerta/cámara para registrar en SQLite al aprobar.
+    camera_label: etiqueta visual ('Cam 1' o 'Cam 2') en el mensaje Telegram.
+    """
+    if puerta_id is None:
+        puerta_id = ID_PUERTA
+
     caption = (
-        f"\U0001f50d *Validar detección*\n"
+        f"\U0001f50d *Validar detección — {camera_label}*\n"
         f"\U0001f522 Número: `{numero}`\n"
         f"\U0001f4ca Confianza: `{round(confianza * 100)}%`\n"
         f"\U0001f4cb Estado: `{estado}`\n"
@@ -143,22 +156,22 @@ def enviar_a_validador(frame_path, numero, confianza, ts, estado, no_detectado=N
     if msg_id:
         with _pendientes_lock:
             _pendientes[msg_id] = {
-                "numero":       numero,
-                "no_detectado": no_detectado or numero,
-                "confianza":    confianza,
-                "ts":           ts,
-                "estado":       estado,
-                "frame_path":   frame_path,
-                "duracion":     0,
-                "thumb_name":   thumb_name,  # <--- NUEVO
+                "numero":        numero,
+                "no_detectado":  no_detectado or numero,
+                "confianza":     confianza,
+                "ts":            ts,
+                "estado":        estado,
+                "frame_path":    frame_path,
+                "duracion":      0,
+                "thumb_name":    thumb_name,
+                "puerta_id":     puerta_id,
+                "camera_label":  camera_label,
             }
-        print(f"[VALIDADOR] {numero} enviado (msg_id={msg_id})")
+        print(f"[VALIDADOR] {numero} ({camera_label}) enviado (msg_id={msg_id})")
         return msg_id
     print(f"[VALIDADOR] Fallo envío → fallback al grupo")
     alerta_unidad_detectada(frame_path, numero, confianza, ts)
     return None
-
-
 
 
 def actualizar_pendiente(msg_id, numero_ganador, confianza_ganadora, estado_ganador, duracion):
@@ -172,7 +185,7 @@ def actualizar_pendiente(msg_id, numero_ganador, confianza_ganadora, estado_gana
                 "estado":    estado_ganador,
                 "duracion":  duracion,
             })
-            print(f"[VALIDADOR] {msg_id} actualizado → {numero_ganador} | {duracion}s")
+            print(f"[VALIDADOR] {msg_id} → {numero_ganador} | {duracion}s")
         else:
             print(f"[VALIDADOR] {msg_id} ya procesado antes de que saliera el bus")
 
@@ -181,13 +194,11 @@ def actualizar_pendiente(msg_id, numero_ganador, confianza_ganadora, estado_gana
 # Alertas directas — detecciones DESCONOCIDAS
 # ==============================================================================
 
-def alerta_unidad_desconocida(frame_path, numero, confianza, ts):
-    """
-    Manda al VALIDADOR (no al grupo) con botones para confirmar o ignorar.
-    Evita que OCR basura llegue al chat de monitoreo.
-    """
+def alerta_unidad_desconocida(frame_path, numero, confianza, ts,
+                               camera_label='Cam 1'):
+    """Manda al VALIDADOR con botones 📢/🗑. No va al grupo directamente."""
     caption = (
-        f"\U0001f50d *¿Número desconocido?*\n"
+        f"\U0001f50d *¿Número desconocido? — {camera_label}*\n"
         f"\U0001f522 OCR leyó: `{numero}`\n"
         f"\U0001f4ca Confianza YOLO: `{round(confianza * 100)}%`\n"
         f"\U0001f550 Hora: `{ts}`\n\n"
@@ -201,12 +212,13 @@ def alerta_unidad_desconocida(frame_path, numero, confianza, ts):
     if msg_id:
         with _pendientes_lock:
             _pendientes_desc[msg_id] = {
-                "numero":    numero,
-                "confianza": confianza,
-                "ts":        ts,
-                "frame_path": frame_path,
+                "numero":       numero,
+                "confianza":    confianza,
+                "ts":           ts,
+                "frame_path":   frame_path,
+                "camera_label": camera_label,
             }
-    print(f"[DESCONOCIDA] '{numero}' → validador (no al grupo)")
+    print(f"[DESCONOCIDA] '{numero}' ({camera_label}) → validador")
 
 
 # ==============================================================================
@@ -264,7 +276,7 @@ def _procesar_callbacks():
                     else:
                         _responder_callback(cb_id, "🗑 Ignorado")
                         _borrar_frame(datos["frame_path"])
-                        print(f"[DESCONOCIDA] '{datos['numero']}' ignorada por validador")
+                        print(f"[DESCONOCIDA] '{datos['numero']}' ignorada")
 
         except requests.exceptions.Timeout:
             continue
@@ -274,23 +286,23 @@ def _procesar_callbacks():
 
 
 def _on_correcto(msg_id, datos):
-    numero     = datos["numero"]
-    confianza  = datos["confianza"]
-    ts         = datos["ts"]
-    estado     = datos["estado"]
-    frame_path = datos["frame_path"]
-    no_det     = datos["no_detectado"]
-    duracion   = datos.get("duracion", 0)
-    thumb_name = datos.get("thumb_name") # <--- NUEVO
+    numero        = datos["numero"]
+    confianza     = datos["confianza"]
+    ts            = datos["ts"]
+    estado        = datos["estado"]
+    frame_path    = datos["frame_path"]
+    no_det        = datos["no_detectado"]
+    duracion      = datos.get("duracion", 0)
+    thumb_name    = datos.get("thumb_name")
+    puerta_id     = datos.get("puerta_id", ID_PUERTA)
+    camera_label  = datos.get("camera_label", "Cam 1")
 
-    # Construimos la URL para el dashboard si existe el thumbnail
     captura_url = f"/frames/crops/{thumb_name}" if thumb_name else None
-
-    # Pasamos la captura_url en lugar de None
-    _db_insert(no_det, numero, confianza, captura_url, estado, duracion)
+    _db_insert(no_det, numero, confianza, captura_url, estado, duracion,
+               puerta_id=puerta_id)
 
     caption = (
-        f"✅ *Unidad VERIFICADA*\n"
+        f"✅ *Unidad VERIFICADA — {camera_label}*\n"
         f"🔢 Número: `{numero}`\n"
         f"📊 Confianza: `{round(confianza * 100)}%`\n"
         f"🕐 Hora: `{ts}`\n"
@@ -298,7 +310,7 @@ def _on_correcto(msg_id, datos):
         f"👤 _Validado manualmente_"
     )
     _enviar_foto(TG_CHAT_ID, frame_path, caption)
-    print(f"[VERIFICADO] {numero} → SQLite + grupo")
+    print(f"[VERIFICADO] {numero} ({camera_label}) → SQLite (puerta={puerta_id}) + grupo")
 
     _borrar_frame(frame_path)
 
@@ -322,14 +334,14 @@ def _on_incorrecto(msg_id, datos):
 
 
 def _on_desconocida_confirmada(datos):
-    """Validador confirmó que la desconocida debe llegar al grupo."""
-    numero     = datos["numero"]
-    confianza  = datos["confianza"]
-    ts         = datos["ts"]
-    frame_path = datos["frame_path"]
+    numero        = datos["numero"]
+    confianza     = datos["confianza"]
+    ts            = datos["ts"]
+    frame_path    = datos["frame_path"]
+    camera_label  = datos.get("camera_label", "Cam 1")
 
     caption = (
-        f"🚫 *NÚMERO DESCONOCIDO*\n"
+        f"🚫 *NÚMERO DESCONOCIDO — {camera_label}*\n"
         f"🔢 OCR leyó: `{numero}`\n"
         f"❌ No registrado en la base de datos\n"
         f"📊 Confianza YOLO: `{round(confianza * 100)}%`\n"
@@ -337,7 +349,7 @@ def _on_desconocida_confirmada(datos):
     )
     _enviar_foto(TG_CHAT_ID, frame_path, caption)
     _borrar_frame(frame_path)
-    print(f"[DESCONOCIDA CONFIRMADA] '{numero}' enviada al grupo")
+    print(f"[DESCONOCIDA CONFIRMADA] '{numero}' ({camera_label}) → grupo")
 
 
 # ==============================================================================
@@ -345,7 +357,7 @@ def _on_desconocida_confirmada(datos):
 # ==============================================================================
 
 def alerta_unidad_detectada(frame_path, numero, confianza, ts):
-    """Fallback directo al grupo (cuando falla enviar_a_validador)."""
+    """Fallback directo al grupo cuando falla enviar_a_validador."""
     caption = (
         f"🚌 *Unidad detectada*\n"
         f"🔢 Número: `{numero}`\n"
@@ -385,3 +397,4 @@ def enviar_a_swagger(datos):
 
 threading.Thread(target=_procesar_callbacks, daemon=True).start()
 print("[VALIDADOR] Listener de callbacks iniciado")
+_enviar_mensaje(TG_VALIDADOR_ID, "🟢 *Sistema CISA iniciado*\n_Lista para recibir detecciones._")
